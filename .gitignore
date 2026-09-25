@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+.pytest_cache/
+datasets/
+checkpoints/
+runs/
+*.pyc
+external/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# External repositories and datasets
+external/
+
+# Training outputs
+runs/
+checkpoints/
+*.pt
+*.pth
