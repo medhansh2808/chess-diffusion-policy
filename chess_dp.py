@@ -2,9 +2,7 @@ import argparse
 import copy
 import json
 import math
-import sqlite3
 import time
-import zlib
 from pathlib import Path
 
 
@@ -33,118 +31,6 @@ CAMERA_KEYS = ("top", "left", "right")
 
 
 
-def prepare_frame_cache(episode_dir, expected_frames):
-    video_path = (
-        Path(episode_dir)
-        / "combined_camera-images-rgb.mp4"
-    )
-
-    if not video_path.is_file():
-        raise FileNotFoundError(video_path)
-
-    cache_path = video_path.with_suffix(".frames.sqlite3")
-    video_stat = video_path.stat()
-    source_info = (
-        video_stat.st_size,
-        video_stat.st_mtime_ns,
-        int(expected_frames),
-    )
-
-    if cache_path.is_file():
-        try:
-            connection = sqlite3.connect(cache_path)
-            try:
-                cached_info = connection.execute(
-                    "SELECT source_size, source_mtime_ns, frame_count "
-                    "FROM metadata"
-                ).fetchone()
-            finally:
-                connection.close()
-
-            if cached_info == source_info:
-                return cache_path
-        except sqlite3.Error:
-            pass
-
-    print(f"Building frame cache: {video_path}", flush=True)
-    cap = cv2.VideoCapture(str(video_path))
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-
-    temporary_path = cache_path.with_suffix(".tmp")
-    temporary_path.unlink(missing_ok=True)
-    connection = None
-
-    try:
-        connection = sqlite3.connect(temporary_path)
-        connection.execute(
-            "CREATE TABLE frames ("
-            "frame_idx INTEGER PRIMARY KEY, "
-            "height INTEGER NOT NULL, "
-            "width INTEGER NOT NULL, "
-            "data BLOB NOT NULL)"
-        )
-        connection.execute(
-            "CREATE TABLE metadata ("
-            "source_size INTEGER, "
-            "source_mtime_ns INTEGER, "
-            "frame_count INTEGER)"
-        )
-
-        frame_count = 0
-
-        while True:
-            ok, frame = cap.read()
-
-            if not ok:
-                break
-
-            height, width, channels = frame.shape
-
-            if channels != 3:
-                raise ValueError(
-                    f"Unexpected frame shape: {frame.shape}"
-                )
-
-            connection.execute(
-                "INSERT INTO frames VALUES (?, ?, ?, ?)",
-                (
-                    frame_count,
-                    height,
-                    width,
-                    sqlite3.Binary(
-                        zlib.compress(frame.tobytes(), level=1)
-                    ),
-                ),
-            )
-            frame_count += 1
-
-        if frame_count != expected_frames:
-            raise RuntimeError(
-                f"Video/state length mismatch in {episode_dir}: "
-                f"{frame_count} video frames, "
-                f"{expected_frames} state frames"
-            )
-
-        connection.execute(
-            "INSERT INTO metadata VALUES (?, ?, ?)",
-            source_info,
-        )
-        connection.commit()
-        connection.close()
-        connection = None
-        cap.release()
-        temporary_path.replace(cache_path)
-        return cache_path
-
-    finally:
-        if connection is not None:
-            connection.close()
-        cap.release()
-        temporary_path.unlink(missing_ok=True)
-
-
 def load_camera_frame(
     episode_dir,
     frame_idx,
@@ -152,7 +38,7 @@ def load_camera_frame(
     image_size=224,
 ):
     """
-    Load one timestep from ABC's sequentially decoded frame cache.
+    Decode one timestep from ABC's vertically stacked MP4.
 
 
     Returns:
@@ -179,35 +65,27 @@ def load_camera_frame(
         )
 
 
-    cache_path = video_path.with_suffix(".frames.sqlite3")
+    cap = cv2.VideoCapture(str(video_path))
 
-    if not cache_path.is_file():
+    if not cap.isOpened():
         raise RuntimeError(
-            f"Missing frame cache: {cache_path}. "
-            "Initialize ChessDataset before reading images."
+            f"Cannot open video: {video_path}"
         )
 
-    connection = sqlite3.connect(cache_path)
     try:
-        row = connection.execute(
-            "SELECT height, width, data FROM frames "
-            "WHERE frame_idx = ?",
-            (int(frame_idx),),
-        ).fetchone()
-    finally:
-        connection.close()
-
-    if row is None:
-        raise IndexError(
-            f"Frame {frame_idx} not found in {cache_path}"
+        cap.set(
+            cv2.CAP_PROP_POS_FRAMES,
+            int(frame_idx),
         )
+        ok, frame = cap.read()
+    finally:
+        cap.release()
 
-    height, width, data = row
-    frame = np.frombuffer(
-        zlib.decompress(data),
-        dtype=np.uint8,
-    ).reshape(height, width, 3)
-
+    if not ok:
+        raise RuntimeError(
+            f"Failed to decode frame {frame_idx}: "
+            f"{video_path}"
+        )
 
     # OpenCV uses BGR. ResNet expects RGB.
     frame = cv2.cvtColor(
@@ -347,12 +225,6 @@ class ChessDataset(Dataset):
                     f"{episode_dir}"
                 )
 
-
-            if load_images:
-                prepare_frame_cache(
-                    episode_dir=episode_dir,
-                    expected_frames=len(states),
-                )
 
             self.episodes.append({
                 "path": episode_dir,
