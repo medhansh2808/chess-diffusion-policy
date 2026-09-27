@@ -1304,6 +1304,9 @@ def save_training_checkpoint(
 
 
 def train(args):
+    if args.overfit_one and args.overfit_episode:
+        raise ValueError("Choose only one overfitting mode")
+
     if args.steps < 1:
         raise ValueError(
             "--steps must be positive"
@@ -1402,6 +1405,12 @@ def train(args):
         )
 
 
+    if args.overfit_episode:
+        if not 0 <= args.episode_index < len(train_paths):
+            raise ValueError("--episode-index is outside the training episode list")
+        train_paths = [train_paths[args.episode_index]]
+        print(f"Overfitting episode: {train_paths[0].name}", flush=True)
+
     train_dataset = ChessDataset(
         episode_dirs=train_paths,
         observation_horizon=2,
@@ -1438,9 +1447,25 @@ def train(args):
         val_indices,
     )
 
+    train_samples = train_dataset
+    if args.overfit_one:
+        sample_index = len(train_dataset.episodes[0]["states"]) // 2
+        train_samples = Subset(train_dataset, [sample_index])
+        val_subset = Subset(train_dataset, [sample_index])
+        print(f"Overfitting sample index: {sample_index}", flush=True)
+    elif args.overfit_episode:
+        # Evaluate on fixed windows from the SAME episode: this is a
+        # memorization diagnostic, not held-out validation.
+        indices = np.linspace(
+            0, len(train_dataset) - 1,
+            min(args.val_samples, len(train_dataset)),
+            dtype=int,
+        ).tolist()
+        val_subset = Subset(train_dataset, indices)
+        print(f"Episode actions: {len(train_dataset)}", flush=True)
 
     train_loader = DataLoader(
-        train_dataset,
+        train_samples,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -1462,7 +1487,7 @@ def train(args):
 
 
     print(
-        f"Training samples: {len(train_dataset)}",
+        f"Training samples: {len(train_samples)}",
         flush=True,
     )
 
@@ -1539,6 +1564,10 @@ def train(args):
         "seed": args.seed,
         "val_samples": args.val_samples,
         "val_seed": args.val_seed,
+        "overfit_one": args.overfit_one,
+        "overfit_episode": args.overfit_episode,
+        "overfit_episode_name": train_paths[0].name if args.overfit_episode else None,
+        "episode_index": args.episode_index if args.overfit_episode else None,
     }
 
 
@@ -1568,6 +1597,10 @@ def train(args):
             "total_steps",
             "val_samples",
             "val_seed",
+            "overfit_one",
+            "overfit_episode",
+            "overfit_episode_name",
+            "episode_index",
         ):
             if (
                 key in saved_config
@@ -2041,6 +2074,24 @@ def main():
         default=None,
     )
 
+
+    parser.add_argument(
+        "--overfit-one",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--overfit-episode",
+        action="store_true",
+        help="Train on all windows from one training demonstration",
+    )
+
+    parser.add_argument(
+        "--episode-index",
+        type=int,
+        default=0,
+        help="Index in the sorted training episode list (default: 0)",
+    )
 
     parser.add_argument(
         "--no-pretrained",
