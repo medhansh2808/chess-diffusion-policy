@@ -5,30 +5,262 @@ import math
 import time
 from pathlib import Path
 
-
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision.models import resnet18, ResNet18_Weights
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision.models import ResNet18_Weights, resnet18
 
-
-from abc_minimal.episode_io import (
-    load_episode,
-    discover_episodes,
-)
-from diffusion_policy.model.diffusion.conditional_unet1d import (
-    ConditionalUnet1D,
-)
-
-
+from abc_minimal.episode_io import discover_episodes, load_episode
+from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 
 
 TASK_NAME = "sim_set_up_chess_pieces_on_the_board"
 CAMERA_KEYS = ("top", "left", "right")
 
+DEFAULT_OBSERVATION_HORIZON = 2
+DEFAULT_PREDICTION_HORIZON = 20
+DEFAULT_STATE_DIM = 14
+DEFAULT_ACTION_DIM = 14
+DEFAULT_VISION_FEATURE_DIM = 128
 
+DEFAULT_DIFFUSION_STEPS = 100
+DEFAULT_NOISE_SCHEDULE = "cosine"
+DEFAULT_DIFFUSION_STEP_EMBED_DIM = 128
+DEFAULT_UNET_DOWN_DIMS = (128, 256, 512)
+DEFAULT_UNET_KERNEL_SIZE = 5
+DEFAULT_UNET_N_GROUPS = 8
+
+REQUIRED_STAT_KEYS = (
+    "state_mean",
+    "state_std",
+    "action_mean",
+    "action_std",
+)
+
+OPTIONAL_STAT_KEYS = (
+    "state_min",
+    "state_max",
+    "action_min",
+    "action_max",
+)
+
+
+def preprocess_rgb_image(image, image_size):
+    """
+    Convert one RGB HWC image into a float CHW tensor in [0, 1].
+
+    The resize preserves aspect ratio and pads to a square. This function is
+    shared by training and rollout so the model sees identical preprocessing.
+    """
+    image = np.asarray(image)
+
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Expected RGB HWC image, got shape {image.shape}")
+
+    if image_size < 1:
+        raise ValueError("image_size must be positive")
+
+    if image.dtype != np.uint8:
+        if np.issubdtype(image.dtype, np.floating):
+            if not np.isfinite(image).all():
+                raise ValueError("Image contains NaN/Inf")
+            max_value = float(image.max()) if image.size else 0.0
+            if max_value <= 1.0:
+                image = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                image = np.clip(image, 0.0, 255.0).astype(np.uint8)
+        else:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
+    height, width = image.shape[:2]
+
+    if height < 1 or width < 1:
+        raise ValueError(f"Invalid image shape: {image.shape}")
+
+    scale = min(
+        image_size / float(width),
+        image_size / float(height),
+    )
+
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+
+    resized = cv2.resize(
+        image,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+    pad_left = (image_size - resized_width) // 2
+    pad_right = image_size - resized_width - pad_left
+    pad_top = (image_size - resized_height) // 2
+    pad_bottom = image_size - resized_height - pad_top
+
+    padded = cv2.copyMakeBorder(
+        resized,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+
+    if padded.shape != (image_size, image_size, 3):
+        raise RuntimeError(f"Unexpected preprocessed image shape: {padded.shape}")
+
+    return (
+        torch.from_numpy(np.ascontiguousarray(padded))
+        .permute(2, 0, 1)
+        .float()
+        .div_(255.0)
+    )
+
+
+def augment_image_sequence(
+    images,
+    max_shift=8,
+    brightness=0.10,
+    contrast=0.10,
+    saturation=0.10,
+):
+    """
+    Mild augmentation for training only.
+
+    images:
+        (..., 3, H, W)
+
+    A single spatial/color transform is shared across every camera and every
+    observation timestep in the sample. This preserves temporal consistency.
+    """
+    if images.ndim < 4 or images.shape[-3] != 3:
+        raise ValueError(f"Unexpected image tensor shape: {tuple(images.shape)}")
+
+    original_shape = images.shape
+    height, width = images.shape[-2:]
+
+    flat = images.reshape(-1, 3, height, width)
+
+    if max_shift > 0:
+        padded = F.pad(
+            flat,
+            (max_shift, max_shift, max_shift, max_shift),
+            mode="replicate",
+        )
+
+        offset_y = int(
+            torch.randint(
+                0,
+                2 * max_shift + 1,
+                (1,),
+            ).item()
+        )
+        offset_x = int(
+            torch.randint(
+                0,
+                2 * max_shift + 1,
+                (1,),
+            ).item()
+        )
+
+        flat = padded[
+            :,
+            :,
+            offset_y:offset_y + height,
+            offset_x:offset_x + width,
+        ]
+
+    brightness_factor = 1.0 + float(
+        torch.empty(1).uniform_(-brightness, brightness).item()
+    )
+    contrast_factor = 1.0 + float(
+        torch.empty(1).uniform_(-contrast, contrast).item()
+    )
+    saturation_factor = 1.0 + float(
+        torch.empty(1).uniform_(-saturation, saturation).item()
+    )
+
+    flat = flat * brightness_factor
+
+    spatial_mean = flat.mean(
+        dim=(-2, -1),
+        keepdim=True,
+    )
+    flat = (
+        spatial_mean
+        + contrast_factor * (flat - spatial_mean)
+    )
+
+    grayscale = flat.mean(
+        dim=1,
+        keepdim=True,
+    )
+    flat = (
+        grayscale
+        + saturation_factor * (flat - grayscale)
+    )
+
+    flat = flat.clamp(0.0, 1.0)
+
+    return flat.reshape(original_shape)
+
+
+def validate_episode_video(
+    video_path,
+    expected_frames,
+    source_cameras,
+):
+    """
+    Catch broken videos/camera metadata before training starts.
+    """
+    video_path = Path(video_path)
+
+    if not video_path.is_file():
+        raise FileNotFoundError(video_path)
+
+    source_cameras = tuple(source_cameras)
+
+    if not source_cameras:
+        raise ValueError(f"No camera metadata for {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    try:
+        reported_frames = int(
+            round(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        )
+
+        ok, first_frame = cap.read()
+    finally:
+        cap.release()
+
+    if not ok:
+        raise RuntimeError(f"Cannot decode first frame: {video_path}")
+
+    if reported_frames > 0 and reported_frames < expected_frames:
+        raise ValueError(
+            f"Video/state mismatch for {video_path}: "
+            f"video reports {reported_frames} frames, "
+            f"but episode has {expected_frames} timesteps"
+        )
+
+    if first_frame.ndim != 3 or first_frame.shape[2] != 3:
+        raise ValueError(
+            f"Unexpected video frame shape for {video_path}: "
+            f"{first_frame.shape}"
+        )
+
+    if first_frame.shape[0] % len(source_cameras) != 0:
+        raise ValueError(
+            f"Vertically stacked video height {first_frame.shape[0]} "
+            f"is not divisible by {len(source_cameras)} cameras: "
+            f"{source_cameras}"
+        )
 
 
 def load_camera_frame(
@@ -40,37 +272,29 @@ def load_camera_frame(
     """
     Decode one timestep from ABC's vertically stacked MP4.
 
-
     Returns:
-        (3, 3, image_size, image_size)
-
+        (3 cameras, 3 RGB channels, image_size, image_size)
 
     Camera order:
         top, left, right
     """
-
-
     video_path = (
         Path(episode_dir)
         / "combined_camera-images-rgb.mp4"
     )
 
-
     source_cameras = tuple(source_cameras)
-
 
     if not set(CAMERA_KEYS).issubset(source_cameras):
         raise ValueError(
-            f"Missing cameras: {source_cameras}"
+            f"Missing required cameras. "
+            f"Required={CAMERA_KEYS}, available={source_cameras}"
         )
-
 
     cap = cv2.VideoCapture(str(video_path))
 
     if not cap.isOpened():
-        raise RuntimeError(
-            f"Cannot open video: {video_path}"
-        )
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
     try:
         cap.set(
@@ -83,33 +307,27 @@ def load_camera_frame(
 
     if not ok:
         raise RuntimeError(
-            f"Failed to decode frame {frame_idx}: "
-            f"{video_path}"
+            f"Failed to decode frame {frame_idx}: {video_path}"
         )
 
-    # OpenCV uses BGR. ResNet expects RGB.
     frame = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB,
     )
 
-
     num_cameras = len(source_cameras)
-
 
     if frame.shape[0] % num_cameras != 0:
         raise ValueError(
-            f"Unexpected video shape: {frame.shape}"
+            f"Unexpected stacked video shape {frame.shape} "
+            f"for {num_cameras} cameras"
         )
-
 
     camera_height = (
         frame.shape[0] // num_cameras
     )
 
-
     cameras = {}
-
 
     for i, name in enumerate(source_cameras):
         image = frame[
@@ -117,21 +335,10 @@ def load_camera_frame(
             (i + 1) * camera_height
         ]
 
-
-        image = cv2.resize(
+        cameras[name] = preprocess_rgb_image(
             image,
-            (image_size, image_size),
-            interpolation=cv2.INTER_LINEAR,
+            image_size=image_size,
         )
-
-
-        cameras[name] = (
-            torch.from_numpy(image.copy())
-            .permute(2, 0, 1)
-            .float()
-            / 255.0
-        )
-
 
     return torch.stack(
         [cameras[name] for name in CAMERA_KEYS],
@@ -139,313 +346,292 @@ def load_camera_frame(
     )
 
 
+def normalize_states_array(states, stats):
+    states = np.asarray(states, dtype=np.float32)
+    return (
+        states - stats["state_mean"]
+    ) / stats["state_std"]
+
+
+def denormalize_actions_array(actions, stats):
+    actions = np.asarray(actions, dtype=np.float32)
+    return (
+        actions * stats["action_std"]
+        + stats["action_mean"]
+    )
+
+
 class ChessDataset(Dataset):
     def __init__(
         self,
         episode_dirs,
-        observation_horizon=2,
-        prediction_horizon=20,
+        observation_horizon=DEFAULT_OBSERVATION_HORIZON,
+        prediction_horizon=DEFAULT_PREDICTION_HORIZON,
         stats=None,
         load_images=True,
         image_size=224,
+        augment=False,
+        validate_videos=True,
     ):
         super().__init__()
 
-
         if observation_horizon < 1:
-            raise ValueError(
-                "Observation horizon must be positive"
-            )
-
+            raise ValueError("Observation horizon must be positive")
 
         if prediction_horizon < 1:
-            raise ValueError(
-                "Prediction horizon must be positive"
-            )
+            raise ValueError("Prediction horizon must be positive")
 
-
-        self.observation_horizon = (
-            observation_horizon
-        )
-        self.prediction_horizon = (
-            prediction_horizon
-        )
-        self.load_images = load_images
-        self.image_size = image_size
-
+        self.observation_horizon = int(observation_horizon)
+        self.prediction_horizon = int(prediction_horizon)
+        self.load_images = bool(load_images)
+        self.image_size = int(image_size)
+        self.augment = bool(augment)
 
         self.episodes = []
-
 
         for episode_dir in episode_dirs:
             episode_dir = Path(episode_dir)
 
-
-            metadata, states, actions = (
-                load_episode(episode_dir)
+            metadata, states, actions = load_episode(
+                episode_dir
             )
 
+            states = np.asarray(
+                states,
+                dtype=np.float32,
+            )
+            actions = np.asarray(
+                actions,
+                dtype=np.float32,
+            )
 
             if len(states) != len(actions):
                 raise ValueError(
-                    f"State/action length mismatch: "
-                    f"{episode_dir}"
+                    f"State/action length mismatch: {episode_dir}"
                 )
-
 
             if (
                 states.ndim != 2
-                or states.shape[1] != 14
+                or states.shape[1] != DEFAULT_STATE_DIM
                 or actions.ndim != 2
-                or actions.shape[1] != 14
+                or actions.shape[1] != DEFAULT_ACTION_DIM
             ):
                 raise ValueError(
-                    f"Expected 14D states and actions: "
-                    f"{episode_dir}"
+                    f"Expected 14D states/actions in {episode_dir}; "
+                    f"got states={states.shape}, actions={actions.shape}"
                 )
 
+            if not np.isfinite(states).all():
+                raise ValueError(
+                    f"Non-finite state values in {episode_dir}"
+                )
 
-            if len(states) == 0:
+            if not np.isfinite(actions).all():
+                raise ValueError(
+                    f"Non-finite action values in {episode_dir}"
+                )
+
+            # We only train on samples that have a complete future action chunk.
+            if len(states) < self.prediction_horizon:
                 continue
-
 
             cameras = tuple(
                 metadata.get("cameras", ())
             )
 
-
             if (
-                load_images
-                and not set(CAMERA_KEYS).issubset(
-                    cameras
-                )
+                self.load_images
+                and not set(CAMERA_KEYS).issubset(cameras)
             ):
                 raise ValueError(
-                    f"Missing camera metadata: "
-                    f"{episode_dir}"
+                    f"Missing camera metadata in {episode_dir}. "
+                    f"Required={CAMERA_KEYS}, available={cameras}"
                 )
 
+            if self.load_images and validate_videos:
+                validate_episode_video(
+                    episode_dir / "combined_camera-images-rgb.mp4",
+                    expected_frames=len(states),
+                    source_cameras=cameras,
+                )
 
             self.episodes.append({
                 "path": episode_dir,
                 "cameras": cameras,
-                "states": states.astype(
-                    np.float32
-                ),
-                "actions": actions.astype(
-                    np.float32
-                ),
+                "states": states,
+                "actions": actions,
             })
-
 
         if not self.episodes:
             raise ValueError(
-                "No usable episodes provided"
+                "No usable episodes provided. "
+                "Episodes must contain at least prediction_horizon timesteps."
             )
 
-
-        # Compute statistics on training data only.
-        # Validation reuses the same statistics.
         if stats is None:
             all_states = np.concatenate(
-                [
-                    ep["states"]
-                    for ep in self.episodes
-                ],
+                [ep["states"] for ep in self.episodes],
                 axis=0,
             )
-
-
             all_actions = np.concatenate(
-                [
-                    ep["actions"]
-                    for ep in self.episodes
-                ],
+                [ep["actions"] for ep in self.episodes],
                 axis=0,
             )
-
 
             stats = {
-                "state_mean":
-                    all_states.mean(axis=0),
-
-
-                "state_std":
-                    np.maximum(
-                        all_states.std(axis=0),
-                        1e-6,
-                    ),
-
-
-                "action_mean":
-                    all_actions.mean(axis=0),
-
-
-                "action_std":
-                    np.maximum(
-                        all_actions.std(axis=0),
-                        1e-6,
-                    ),
+                "state_mean": all_states.mean(axis=0),
+                "state_std": np.maximum(
+                    all_states.std(axis=0),
+                    1e-6,
+                ),
+                "action_mean": all_actions.mean(axis=0),
+                "action_std": np.maximum(
+                    all_actions.std(axis=0),
+                    1e-6,
+                ),
+                "state_min": all_states.min(axis=0),
+                "state_max": all_states.max(axis=0),
+                "action_min": all_actions.min(axis=0),
+                "action_max": all_actions.max(axis=0),
             }
 
+        self.stats = {}
 
-        required_keys = (
-            "state_mean",
-            "state_std",
-            "action_mean",
-            "action_std",
-        )
+        for key in REQUIRED_STAT_KEYS:
+            if key not in stats:
+                raise KeyError(f"Missing normalization statistic: {key}")
 
-
-        self.stats = {
-            key: np.asarray(
+            value = np.asarray(
                 stats[key],
                 dtype=np.float32,
             ).copy()
-            for key in required_keys
-        }
 
-
-        for key, value in self.stats.items():
-            if value.shape != (14,):
+            if value.shape != (DEFAULT_STATE_DIM,):
                 raise ValueError(
-                    f"{key} must have shape (14,)"
+                    f"{key} must have shape (14,), got {value.shape}"
                 )
 
+            if not np.isfinite(value).all():
+                raise ValueError(f"{key} contains NaN/Inf")
 
-        self.state_mean = (
-            self.stats["state_mean"]
-        )
-        self.state_std = (
-            self.stats["state_std"]
-        )
-        self.action_mean = (
-            self.stats["action_mean"]
-        )
-        self.action_std = (
-            self.stats["action_std"]
-        )
+            self.stats[key] = value
 
+        for key in OPTIONAL_STAT_KEYS:
+            if key in stats:
+                value = np.asarray(
+                    stats[key],
+                    dtype=np.float32,
+                ).copy()
 
-        # Every episode timestep can start a sample.
-        self.indices = [
-            (episode_idx, t)
-            for episode_idx, ep in enumerate(
-                self.episodes
+                if value.shape != (DEFAULT_STATE_DIM,):
+                    raise ValueError(
+                        f"{key} must have shape (14,), got {value.shape}"
+                    )
+
+                if not np.isfinite(value).all():
+                    raise ValueError(f"{key} contains NaN/Inf")
+
+                self.stats[key] = value
+
+        if np.any(self.stats["state_std"] <= 0):
+            raise ValueError("state_std must be strictly positive")
+
+        if np.any(self.stats["action_std"] <= 0):
+            raise ValueError("action_std must be strictly positive")
+
+        self.state_mean = self.stats["state_mean"]
+        self.state_std = self.stats["state_std"]
+        self.action_mean = self.stats["action_mean"]
+        self.action_std = self.stats["action_std"]
+
+        # IMPORTANT:
+        # Only timesteps with a complete prediction horizon become samples.
+        self.indices = []
+
+        for episode_idx, episode in enumerate(self.episodes):
+            usable = (
+                len(episode["states"])
+                - self.prediction_horizon
+                + 1
             )
-            for t in range(
-                len(ep["states"])
-            )
-        ]
 
+            for t in range(usable):
+                self.indices.append(
+                    (episode_idx, t)
+                )
+
+        if not self.indices:
+            raise ValueError("Dataset contains no complete action chunks")
 
     def __len__(self):
         return len(self.indices)
 
-
     def __getitem__(self, index):
         episode_idx, t = self.indices[index]
-
-
         episode = self.episodes[episode_idx]
-
 
         states = episode["states"]
         actions = episode["actions"]
 
-
         episode_length = len(states)
 
-
-        # Observation history.
         obs_indices = np.arange(
             t - self.observation_horizon + 1,
             t + 1,
         )
 
-
+        # Repeating the first observation is deliberate for the start of an
+        # episode. Unlike the action horizon, this does not invent future data.
         obs_indices = np.clip(
             obs_indices,
             0,
             episode_length - 1,
         )
 
-
-        # Future action chunk.
         action_indices = np.arange(
             t,
             t + self.prediction_horizon,
         )
 
+        if action_indices[-1] >= episode_length:
+            raise RuntimeError(
+                "Internal dataset bug: incomplete action chunk reached __getitem__"
+            )
 
-        is_pad = (
-            action_indices >= episode_length
+        observation_states = normalize_states_array(
+            states[obs_indices],
+            self.stats,
         )
-
-
-        action_indices = np.clip(
-            action_indices,
-            0,
-            episode_length - 1,
-        )
-
-
-        observation_states = (
-            states[obs_indices]
-        )
-
 
         action_sequence = (
             actions[action_indices]
-        )
-
-
-        # Normalize with training statistics.
-        observation_states = (
-            observation_states
-            - self.state_mean
-        ) / self.state_std
-
-
-        action_sequence = (
-            action_sequence
             - self.action_mean
         ) / self.action_std
 
-
         sample = {
             "states": torch.from_numpy(
-                observation_states.copy()
+                np.ascontiguousarray(observation_states)
             ),
             "actions": torch.from_numpy(
-                action_sequence.copy()
-            ),
-            "is_pad": torch.from_numpy(
-                is_pad.copy()
+                np.ascontiguousarray(action_sequence)
             ),
         }
-
 
         if self.load_images:
             frame_cache = {}
 
-
             for frame_idx in obs_indices:
                 frame_idx = int(frame_idx)
 
-
                 if frame_idx not in frame_cache:
-                    frame_cache[frame_idx] = (
-                        load_camera_frame(
-                            episode_dir=episode["path"],
-                            frame_idx=frame_idx,
-                            source_cameras=episode["cameras"],
-                            image_size=self.image_size,
-                        )
+                    frame_cache[frame_idx] = load_camera_frame(
+                        episode_dir=episode["path"],
+                        frame_idx=frame_idx,
+                        source_cameras=episode["cameras"],
+                        image_size=self.image_size,
                     )
 
-
-            sample["images"] = torch.stack(
+            images = torch.stack(
                 [
                     frame_cache[int(idx)]
                     for idx in obs_indices
@@ -453,14 +639,16 @@ class ChessDataset(Dataset):
                 dim=0,
             )
 
+            if self.augment:
+                images = augment_image_sequence(
+                    images
+                )
+
+            sample["images"] = images
 
         return sample
 
-
     def denormalize_actions(self, actions):
-        """Restore actions to the original robot units."""
-
-
         if isinstance(actions, torch.Tensor):
             mean = torch.as_tensor(
                 self.action_mean,
@@ -468,16 +656,13 @@ class ChessDataset(Dataset):
                 dtype=actions.dtype,
             )
 
-
             std = torch.as_tensor(
                 self.action_std,
                 device=actions.device,
                 dtype=actions.dtype,
             )
 
-
             return actions * std + mean
-
 
         return (
             actions * self.action_std
@@ -485,35 +670,29 @@ class ChessDataset(Dataset):
         )
 
 
-
-
-class DDPMScheduler:
+class DDPMScheduler(nn.Module):
     def __init__(
         self,
-        num_train_steps=100,
+        num_train_steps=DEFAULT_DIFFUSION_STEPS,
         beta_start=1e-4,
         beta_end=0.02,
-        schedule="cosine",
+        schedule=DEFAULT_NOISE_SCHEDULE,
     ):
+        super().__init__()
+
         if num_train_steps < 2:
-            raise ValueError(
-                "At least two diffusion steps required"
-            )
+            raise ValueError("At least two diffusion steps required")
 
-
-        self.num_train_steps = (
-            num_train_steps
-        )
-
+        self.num_train_steps = int(num_train_steps)
+        self.schedule = str(schedule)
 
         if schedule == "linear":
-            self.betas = torch.linspace(
+            betas = torch.linspace(
                 beta_start,
                 beta_end,
                 num_train_steps,
                 dtype=torch.float32,
             )
-
 
         elif schedule == "cosine":
             steps = torch.arange(
@@ -521,24 +700,22 @@ class DDPMScheduler:
                 dtype=torch.float64,
             )
 
-
             s = 0.008
-
 
             alpha_bar = torch.cos(
                 (
                     (steps / num_train_steps + s)
                     / (1 + s)
-                ) * math.pi / 2
+                )
+                * math.pi
+                / 2
             ) ** 2
-
 
             alpha_bar = (
                 alpha_bar / alpha_bar[0]
             )
 
-
-            self.betas = (
+            betas = (
                 1
                 - alpha_bar[1:]
                 / alpha_bar[:-1]
@@ -547,29 +724,40 @@ class DDPMScheduler:
                 0.999,
             ).float()
 
-
         else:
             raise ValueError(
                 f"Unknown schedule: {schedule}"
             )
 
-
-        self.alphas = (
-            1.0 - self.betas
-        )
-
-
-        self.alpha_bars = torch.cumprod(
-            self.alphas,
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(
+            alphas,
             dim=0,
         )
-
-
-        self.alpha_bars_prev = torch.cat([
-            torch.ones(1),
-            self.alpha_bars[:-1],
+        alpha_bars_prev = torch.cat([
+            torch.ones(
+                1,
+                dtype=alpha_bars.dtype,
+            ),
+            alpha_bars[:-1],
         ])
 
+        self.register_buffer(
+            "betas",
+            betas,
+        )
+        self.register_buffer(
+            "alphas",
+            alphas,
+        )
+        self.register_buffer(
+            "alpha_bars",
+            alpha_bars,
+        )
+        self.register_buffer(
+            "alpha_bars_prev",
+            alpha_bars_prev,
+        )
 
     def add_noise(
         self,
@@ -577,24 +765,29 @@ class DDPMScheduler:
         noise,
         timesteps,
     ):
-        alpha_bar = self.alpha_bars.to(
-            device=clean_actions.device,
-            dtype=clean_actions.dtype,
-        )[timesteps.long()]
+        if clean_actions.shape != noise.shape:
+            raise ValueError(
+                f"clean/noise shape mismatch: "
+                f"{clean_actions.shape} vs {noise.shape}"
+            )
 
+        if timesteps.ndim != 1 or timesteps.shape[0] != clean_actions.shape[0]:
+            raise ValueError(
+                f"Unexpected timestep shape: {timesteps.shape}"
+            )
 
-        alpha_bar = (
-            alpha_bar[:, None, None]
-        )
+        alpha_bar = self.alpha_bars[
+            timesteps.long()
+        ].to(dtype=clean_actions.dtype)
 
+        alpha_bar = alpha_bar[:, None, None]
 
         return (
             alpha_bar.sqrt()
             * clean_actions
-            + (1 - alpha_bar).sqrt()
+            + (1.0 - alpha_bar).sqrt()
             * noise
         )
-
 
     def step(
         self,
@@ -602,83 +795,61 @@ class DDPMScheduler:
         timestep,
         sample,
     ):
+        if predicted_noise.shape != sample.shape:
+            raise ValueError(
+                f"predicted_noise/sample shape mismatch: "
+                f"{predicted_noise.shape} vs {sample.shape}"
+            )
+
         t = int(timestep)
 
+        if not 0 <= t < self.num_train_steps:
+            raise ValueError(f"Invalid diffusion timestep: {t}")
 
-        device = sample.device
         dtype = sample.dtype
 
-
-        beta_t = self.betas[t].to(
-            device=device,
-            dtype=dtype,
-        )
-
-
-        alpha_t = self.alphas[t].to(
-            device=device,
-            dtype=dtype,
-        )
-
-
-        alpha_bar_t = self.alpha_bars[t].to(
-            device=device,
-            dtype=dtype,
-        )
-
-
-        alpha_bar_prev = (
-            self.alpha_bars_prev[t].to(
-                device=device,
-                dtype=dtype,
-            )
-        )
-
+        beta_t = self.betas[t].to(dtype=dtype)
+        alpha_t = self.alphas[t].to(dtype=dtype)
+        alpha_bar_t = self.alpha_bars[t].to(dtype=dtype)
+        alpha_bar_prev = self.alpha_bars_prev[t].to(dtype=dtype)
 
         predicted_x0 = (
             sample
-            - (1 - alpha_bar_t).sqrt()
+            - (1.0 - alpha_bar_t).sqrt()
             * predicted_noise
         ) / alpha_bar_t.sqrt()
-
 
         coefficient_x0 = (
             alpha_bar_prev.sqrt()
             * beta_t
-            / (1 - alpha_bar_t)
+            / (1.0 - alpha_bar_t)
         )
-
 
         coefficient_xt = (
             alpha_t.sqrt()
-            * (1 - alpha_bar_prev)
-            / (1 - alpha_bar_t)
+            * (1.0 - alpha_bar_prev)
+            / (1.0 - alpha_bar_t)
         )
-
 
         mean = (
             coefficient_x0 * predicted_x0
             + coefficient_xt * sample
         )
 
-
         if t == 0:
             return mean
 
-
         variance = (
             beta_t
-            * (1 - alpha_bar_prev)
-            / (1 - alpha_bar_t)
+            * (1.0 - alpha_bar_prev)
+            / (1.0 - alpha_bar_t)
         )
-
 
         return (
             mean
-            + variance.sqrt()
+            + variance.clamp_min(0.0).sqrt()
             * torch.randn_like(sample)
         )
-
 
     @torch.no_grad()
     def sample(
@@ -693,7 +864,6 @@ class DDPMScheduler:
             device=device,
         )
 
-
         for t in reversed(
             range(self.num_train_steps)
         ):
@@ -704,13 +874,17 @@ class DDPMScheduler:
                 dtype=torch.long,
             )
 
-
             predicted_noise = model(
                 actions,
                 timesteps,
                 condition,
             )
 
+            if predicted_noise.shape != actions.shape:
+                raise RuntimeError(
+                    f"Denoiser returned {predicted_noise.shape}; "
+                    f"expected {actions.shape}"
+                )
 
             actions = self.step(
                 predicted_noise,
@@ -718,21 +892,17 @@ class DDPMScheduler:
                 actions,
             )
 
-
         return actions
-
-
 
 
 class VisionEncoder(nn.Module):
     def __init__(
         self,
-        feature_dim=128,
+        feature_dim=DEFAULT_VISION_FEATURE_DIM,
         pretrained=True,
         freeze_backbone=True,
     ):
         super().__init__()
-
 
         weights = (
             ResNet18_Weights.DEFAULT
@@ -740,29 +910,22 @@ class VisionEncoder(nn.Module):
             else None
         )
 
-
         backbone = resnet18(
             weights=weights
         )
 
-
-        # Replace ImageNet classification head.
         backbone.fc = nn.Identity()
 
-
         self.backbone = backbone
-        self.freeze_backbone = (
+        self.freeze_backbone = bool(
             freeze_backbone
         )
-
 
         self.projection = nn.Sequential(
             nn.Linear(512, feature_dim),
             nn.ReLU(),
         )
 
-
-        # ImageNet normalization.
         self.register_buffer(
             "image_mean",
             torch.tensor([
@@ -771,7 +934,6 @@ class VisionEncoder(nn.Module):
                 0.406,
             ]).view(1, 3, 1, 1),
         )
-
 
         self.register_buffer(
             "image_std",
@@ -782,41 +944,43 @@ class VisionEncoder(nn.Module):
             ]).view(1, 3, 1, 1),
         )
 
-
-        if freeze_backbone:
+        if self.freeze_backbone:
             self.backbone.requires_grad_(
                 False
             )
             self.backbone.eval()
 
-
     def train(self, mode=True):
         super().train(mode)
 
-
-        # Frozen BatchNorm statistics stay fixed.
         if self.freeze_backbone:
             self.backbone.eval()
 
-
         return self
-
 
     def forward(self, images):
         """
-        images: (B, O, 3, 3, H, W)
+        images:
+            (B, O, C, 3, H, W)
 
-
-        O = observation horizon
-        3 cameras
-        3 RGB channels
+        C is the number of cameras.
         """
+        if images.ndim != 6:
+            raise ValueError(
+                f"Expected 6D image tensor, got {images.shape}"
+            )
 
+        B, O, C, RGB, H, W = images.shape
 
-        B, O, C, RGB, H, W = (
-            images.shape
-        )
+        if C != len(CAMERA_KEYS):
+            raise ValueError(
+                f"Expected {len(CAMERA_KEYS)} cameras, got {C}"
+            )
 
+        if RGB != 3:
+            raise ValueError(
+                f"Expected RGB images, got {RGB} channels"
+            )
 
         images = images.reshape(
             B * O * C,
@@ -825,27 +989,23 @@ class VisionEncoder(nn.Module):
             W,
         )
 
-
         images = (
             images - self.image_mean
         ) / self.image_std
 
-
         if self.freeze_backbone:
             with torch.no_grad():
-                features = (
-                    self.backbone(images)
+                features = self.backbone(
+                    images
                 )
         else:
-            features = (
-                self.backbone(images)
+            features = self.backbone(
+                images
             )
 
-
-        features = (
-            self.projection(features)
+        features = self.projection(
+            features
         )
-
 
         return features.reshape(
             B,
@@ -855,78 +1015,124 @@ class VisionEncoder(nn.Module):
         )
 
 
-
-
-
-
 class ChessDiffusionPolicy(nn.Module):
     def __init__(
         self,
-        observation_horizon=2,
-        prediction_horizon=20,
-        state_dim=14,
-        action_dim=14,
-        vision_feature_dim=128,
+        observation_horizon=DEFAULT_OBSERVATION_HORIZON,
+        prediction_horizon=DEFAULT_PREDICTION_HORIZON,
+        state_dim=DEFAULT_STATE_DIM,
+        action_dim=DEFAULT_ACTION_DIM,
+        vision_feature_dim=DEFAULT_VISION_FEATURE_DIM,
         pretrained_vision=True,
         freeze_backbone=True,
+        num_diffusion_steps=DEFAULT_DIFFUSION_STEPS,
+        noise_schedule=DEFAULT_NOISE_SCHEDULE,
+        diffusion_step_embed_dim=DEFAULT_DIFFUSION_STEP_EMBED_DIM,
+        unet_down_dims=DEFAULT_UNET_DOWN_DIMS,
+        unet_kernel_size=DEFAULT_UNET_KERNEL_SIZE,
+        unet_n_groups=DEFAULT_UNET_N_GROUPS,
     ):
         super().__init__()
 
-
-        self.observation_horizon = (
+        self.observation_horizon = int(
             observation_horizon
         )
-        self.prediction_horizon = (
+        self.prediction_horizon = int(
             prediction_horizon
         )
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-
+        self.state_dim = int(
+            state_dim
+        )
+        self.action_dim = int(
+            action_dim
+        )
+        self.vision_feature_dim = int(
+            vision_feature_dim
+        )
 
         self.vision_encoder = VisionEncoder(
-            feature_dim=vision_feature_dim,
+            feature_dim=self.vision_feature_dim,
             pretrained=pretrained_vision,
             freeze_backbone=freeze_backbone,
         )
 
-
         condition_dim = (
-            observation_horizon
+            self.observation_horizon
             * (
-                3 * vision_feature_dim
-                + state_dim
+                len(CAMERA_KEYS)
+                * self.vision_feature_dim
+                + self.state_dim
             )
         )
 
+        self.condition_dim = int(
+            condition_dim
+        )
 
         self.unet = ConditionalUnet1D(
-            input_dim=action_dim,
-            global_cond_dim=condition_dim,
-            diffusion_step_embed_dim=128,
-            down_dims=[128, 256, 512],
-            kernel_size=5,
-            n_groups=8,
+            input_dim=self.action_dim,
+            global_cond_dim=self.condition_dim,
+            diffusion_step_embed_dim=int(
+                diffusion_step_embed_dim
+            ),
+            down_dims=[
+                int(value)
+                for value in unet_down_dims
+            ],
+            kernel_size=int(
+                unet_kernel_size
+            ),
+            n_groups=int(
+                unet_n_groups
+            ),
         )
-
 
         self.scheduler = DDPMScheduler(
-            num_train_steps=100,
-            schedule="cosine",
+            num_train_steps=int(
+                num_diffusion_steps
+            ),
+            schedule=str(
+                noise_schedule
+            ),
         )
-
 
     def encode_observations(
         self,
         states,
         images,
     ):
-        visual_features = (
-            self.vision_encoder(images)
+        if states.ndim != 3:
+            raise ValueError(
+                f"Expected states (B,O,D), got {states.shape}"
+            )
+
+        if (
+            states.shape[1]
+            != self.observation_horizon
+            or states.shape[2]
+            != self.state_dim
+        ):
+            raise ValueError(
+                f"Unexpected state shape {states.shape}; "
+                f"expected (*,{self.observation_horizon},{self.state_dim})"
+            )
+
+        if (
+            images.ndim != 6
+            or images.shape[0] != states.shape[0]
+            or images.shape[1] != self.observation_horizon
+            or images.shape[2] != len(CAMERA_KEYS)
+            or images.shape[3] != 3
+        ):
+            raise ValueError(
+                f"Unexpected image shape: {images.shape}"
+            )
+
+        visual_features = self.vision_encoder(
+            images
         )
 
-
         B, O = states.shape[:2]
-
 
         visual_features = (
             visual_features.reshape(
@@ -936,7 +1142,6 @@ class ChessDiffusionPolicy(nn.Module):
             )
         )
 
-
         condition = torch.cat(
             [
                 visual_features,
@@ -945,29 +1150,45 @@ class ChessDiffusionPolicy(nn.Module):
             dim=-1,
         )
 
-
-        return condition.flatten(
+        condition = condition.flatten(
             start_dim=1
         )
 
+        if condition.shape != (
+            B,
+            self.condition_dim,
+        ):
+            raise RuntimeError(
+                f"Condition shape {condition.shape}; "
+                f"expected {(B, self.condition_dim)}"
+            )
+
+        return condition
 
     def forward(
         self,
         states,
         images,
         actions,
-        is_pad=None,
     ):
-        condition = (
-            self.encode_observations(
-                states,
-                images,
+        if (
+            actions.ndim != 3
+            or actions.shape[1]
+            != self.prediction_horizon
+            or actions.shape[2]
+            != self.action_dim
+        ):
+            raise ValueError(
+                f"Unexpected action shape {actions.shape}; "
+                f"expected (*,{self.prediction_horizon},{self.action_dim})"
             )
+
+        condition = self.encode_observations(
+            states,
+            images,
         )
 
-
         batch_size = actions.shape[0]
-
 
         timesteps = torch.randint(
             0,
@@ -977,20 +1198,15 @@ class ChessDiffusionPolicy(nn.Module):
             dtype=torch.long,
         )
 
-
-        noise = (
-            torch.randn_like(actions)
+        noise = torch.randn_like(
+            actions
         )
 
-
-        noisy_actions = (
-            self.scheduler.add_noise(
-                actions,
-                noise,
-                timesteps,
-            )
+        noisy_actions = self.scheduler.add_noise(
+            actions,
+            noise,
+            timesteps,
         )
-
 
         predicted_noise = self.unet(
             noisy_actions,
@@ -998,32 +1214,15 @@ class ChessDiffusionPolicy(nn.Module):
             global_cond=condition,
         )
 
+        if predicted_noise.shape != noise.shape:
+            raise RuntimeError(
+                f"U-Net returned {predicted_noise.shape}; "
+                f"expected {noise.shape}"
+            )
 
-        error = (
+        return (
             predicted_noise - noise
-        ).square()
-
-
-        if is_pad is not None:
-            mask = (
-                ~is_pad.bool()
-            ).unsqueeze(-1)
-
-
-            valid_values = (
-                mask.sum().clamp(min=1)
-                * actions.shape[-1]
-            )
-
-
-            return (
-                (error * mask).sum()
-                / valid_values
-            )
-
-
-        return error.mean()
-
+        ).square().mean()
 
     @torch.no_grad()
     def predict_actions(
@@ -1031,20 +1230,16 @@ class ChessDiffusionPolicy(nn.Module):
         states,
         images,
     ):
-        condition = (
-            self.encode_observations(
-                states,
-                images,
-            )
+        condition = self.encode_observations(
+            states,
+            images,
         )
-
 
         shape = (
             states.shape[0],
             self.prediction_horizon,
             self.action_dim,
         )
-
 
         def predict_noise(
             noisy,
@@ -1057,7 +1252,6 @@ class ChessDiffusionPolicy(nn.Module):
                 global_cond=cond,
             )
 
-
         return self.scheduler.sample(
             model=predict_noise,
             shape=shape,
@@ -1069,7 +1263,6 @@ class ChessDiffusionPolicy(nn.Module):
 def find_chess_episodes(directory):
     episodes = []
 
-
     for path in discover_episodes(
         Path(directory)
     ):
@@ -1079,19 +1272,13 @@ def find_chess_episodes(directory):
             ).read_text()
         )
 
-
         if (
             metadata.get("task_name")
             == TASK_NAME
         ):
             episodes.append(path)
 
-
     return sorted(episodes)
-
-
-
-
 
 
 @torch.no_grad()
@@ -1109,7 +1296,7 @@ def update_ema(
             1.0 - decay,
         )
 
-
+    # Includes frozen BatchNorm buffers and the diffusion schedule buffers.
     for ema_buffer, buffer in zip(
         ema_model.buffers(),
         model.buffers(),
@@ -1117,31 +1304,18 @@ def update_ema(
         ema_buffer.copy_(buffer)
 
 
-
-
 @torch.no_grad()
-def validate(
+def validate_noise_loss(
     model,
     val_loader,
     device,
     max_batches=20,
     seed=12345,
 ):
-    """
-    Validate using a fixed subset and fixed random seed.
-
-
-    This makes noise-prediction losses more comparable
-    across checkpoints.
-    """
-
-
     model.eval()
-
 
     total_loss = 0.0
     total_samples = 0
-
 
     cuda_devices = (
         [torch.cuda.current_device()]
@@ -1149,13 +1323,10 @@ def validate(
         else []
     )
 
-
-    # Preserve training RNG state.
     with torch.random.fork_rng(
         devices=cuda_devices
     ):
         torch.manual_seed(seed)
-
 
         for batch_idx, batch in enumerate(
             val_loader
@@ -1163,67 +1334,226 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
-
             states = batch["states"].to(
                 device,
                 non_blocking=True,
             )
-
-
             images = batch["images"].to(
                 device,
                 non_blocking=True,
             )
-
-
             actions = batch["actions"].to(
                 device,
                 non_blocking=True,
             )
 
-
-            is_pad = batch["is_pad"].to(
-                device,
-                non_blocking=True,
-            )
-
-
             loss = model(
                 states,
                 images,
                 actions,
-                is_pad,
             )
-
 
             if not torch.isfinite(loss):
                 raise RuntimeError(
-                    "Non-finite validation loss"
+                    "Non-finite validation noise loss"
                 )
 
-
             batch_size = states.shape[0]
-
 
             total_loss += (
                 loss.item() * batch_size
             )
-
-
             total_samples += batch_size
-
 
     if total_samples == 0:
         raise RuntimeError(
             "Validation loader is empty"
         )
 
-
     return (
         total_loss / total_samples
     )
 
 
+@torch.no_grad()
+def validate_generated_actions(
+    model,
+    val_loader,
+    stats,
+    device,
+    max_batches=1,
+    seed=54321,
+):
+    """
+    Run the actual reverse diffusion process and compare generated action chunks
+    with their target chunks.
+
+    This is especially important for --overfit-one. A tiny denoising loss is not
+    enough; the complete sampler must reconstruct the memorized action chunk.
+    """
+    model.eval()
+
+    action_mean = torch.as_tensor(
+        stats["action_mean"],
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 1, -1)
+
+    action_std = torch.as_tensor(
+        stats["action_std"],
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 1, -1)
+
+    total_norm_sq = 0.0
+    total_action_sq = 0.0
+    total_values = 0
+
+    per_dim_sq = torch.zeros(
+        model.action_dim,
+        device=device,
+        dtype=torch.float64,
+    )
+    per_dim_count = 0
+
+    prediction_min = float("inf")
+    prediction_max = float("-inf")
+    target_min = float("inf")
+    target_max = float("-inf")
+
+    cuda_devices = (
+        [torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+
+    with torch.random.fork_rng(
+        devices=cuda_devices
+    ):
+        torch.manual_seed(seed)
+
+        for batch_idx, batch in enumerate(
+            val_loader
+        ):
+            if batch_idx >= max_batches:
+                break
+
+            states = batch["states"].to(
+                device,
+                non_blocking=True,
+            )
+            images = batch["images"].to(
+                device,
+                non_blocking=True,
+            )
+            target = batch["actions"].to(
+                device,
+                non_blocking=True,
+            )
+
+            prediction = model.predict_actions(
+                states,
+                images,
+            )
+
+            if prediction.shape != target.shape:
+                raise RuntimeError(
+                    f"Generated/target shape mismatch: "
+                    f"{prediction.shape} vs {target.shape}"
+                )
+
+            if not torch.isfinite(prediction).all():
+                raise RuntimeError(
+                    "Generated actions contain NaN/Inf"
+                )
+
+            normalized_error = (
+                prediction - target
+            ).square()
+
+            prediction_actions = (
+                prediction * action_std
+                + action_mean
+            )
+            target_actions = (
+                target * action_std
+                + action_mean
+            )
+
+            action_error = (
+                prediction_actions
+                - target_actions
+            ).square()
+
+            total_norm_sq += float(
+                normalized_error.sum().item()
+            )
+            total_action_sq += float(
+                action_error.sum().item()
+            )
+            total_values += int(
+                action_error.numel()
+            )
+
+            per_dim_sq += (
+                action_error.double().sum(
+                    dim=(0, 1)
+                )
+            )
+            per_dim_count += int(
+                action_error.shape[0]
+                * action_error.shape[1]
+            )
+
+            prediction_min = min(
+                prediction_min,
+                float(
+                    prediction_actions.min().item()
+                ),
+            )
+            prediction_max = max(
+                prediction_max,
+                float(
+                    prediction_actions.max().item()
+                ),
+            )
+            target_min = min(
+                target_min,
+                float(
+                    target_actions.min().item()
+                ),
+            )
+            target_max = max(
+                target_max,
+                float(
+                    target_actions.max().item()
+                ),
+            )
+
+    if total_values == 0 or per_dim_count == 0:
+        raise RuntimeError(
+            "Generated-action validation loader is empty"
+        )
+
+    return {
+        "sample_normalized_mse":
+            total_norm_sq / total_values,
+        "sample_action_mse":
+            total_action_sq / total_values,
+        "sample_action_mse_per_dim":
+            (
+                per_dim_sq
+                / per_dim_count
+            ).cpu().tolist(),
+        "sample_prediction_min":
+            prediction_min,
+        "sample_prediction_max":
+            prediction_max,
+        "sample_target_min":
+            target_min,
+        "sample_target_max":
+            target_max,
+    }
 
 
 def save_training_checkpoint(
@@ -1239,95 +1569,103 @@ def save_training_checkpoint(
 ):
     path = Path(path)
 
-
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-
     checkpoint = {
-        "step": step,
-
-
+        "step": int(step),
         "model": model.state_dict(),
-
-
         "ema": ema_model.state_dict(),
-
-
         "optimizer": optimizer.state_dict(),
-
-
         "lr_scheduler":
             lr_scheduler.state_dict(),
-
-
         "stats": {
-            key: value.copy()
+            key: np.asarray(value).copy()
             for key, value in stats.items()
         },
-
-
         "config": config,
-
-
-        "best_val": best_val,
-
-
+        "best_val": float(best_val),
         "torch_rng_state":
             torch.get_rng_state(),
     }
-
 
     if torch.cuda.is_available():
         checkpoint["cuda_rng_state"] = (
             torch.cuda.get_rng_state_all()
         )
 
-
     temporary_path = (
-        path.with_suffix(".tmp")
+        path.with_suffix(
+            path.suffix + ".tmp"
+        )
     )
-
 
     torch.save(
         checkpoint,
         temporary_path,
     )
 
-
-    # Atomic replacement on the same filesystem.
     temporary_path.replace(path)
 
 
+def clear_fresh_run_artifacts(output):
+    """
+    Delete only files created by this training script.
+
+    This is called only when --overwrite-output is explicitly supplied.
+    """
+    candidates = [
+        output / "metrics.jsonl",
+        output / "best.pt",
+        output / "final.pt",
+    ]
+
+    candidates.extend(
+        output.glob("step_*.pt")
+    )
+
+    for path in candidates:
+        if path.is_file():
+            path.unlink()
 
 
 def train(args):
-    if args.overfit_one and args.overfit_episode:
-        raise ValueError("Choose only one overfitting mode")
+    if (
+        args.overfit_one
+        and args.overfit_episode
+    ):
+        raise ValueError(
+            "Choose only one overfitting mode"
+        )
 
     if args.steps < 1:
         raise ValueError(
             "--steps must be positive"
         )
 
-
     if args.batch_size < 1:
         raise ValueError(
             "--batch-size must be positive"
         )
-
 
     if args.val_samples < 1:
         raise ValueError(
             "--val-samples must be positive"
         )
 
+    if args.sample_val_batches < 1:
+        raise ValueError(
+            "--sample-val-batches must be positive"
+        )
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
+    torch.manual_seed(
+        args.seed
+    )
+    np.random.seed(
+        args.seed
+    )
 
     device = torch.device(
         "cuda"
@@ -1335,134 +1673,261 @@ def train(args):
         else "cpu"
     )
 
-
     print(
         f"Device: {device}",
         flush=True,
     )
-
 
     args.output.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-
-    started = time.monotonic()
-
-
     metrics_path = (
         args.output / "metrics.jsonl"
     )
 
+    if args.resume is None:
+        existing_training_files = (
+            metrics_path.exists()
+            or (args.output / "best.pt").exists()
+            or (args.output / "final.pt").exists()
+            or any(args.output.glob("step_*.pt"))
+        )
 
+        if existing_training_files:
+            if not args.overwrite_output:
+                raise RuntimeError(
+                    f"{args.output} already contains training artifacts. "
+                    "Use a new --output, pass --resume, or explicitly pass "
+                    "--overwrite-output."
+                )
 
+            clear_fresh_run_artifacts(
+                args.output
+            )
 
+    elif not args.resume.is_file():
+        raise FileNotFoundError(
+            args.resume
+        )
 
+    started = time.monotonic()
 
     train_paths = find_chess_episodes(
         args.abc_dir / "cache/train_sim"
     )
 
-
     val_paths = find_chess_episodes(
         args.abc_dir / "cache/val_sim"
     )
-
 
     print(
         f"Training episodes: {len(train_paths)}",
         flush=True,
     )
 
-
     print(
         f"Validation episodes: {len(val_paths)}",
         flush=True,
     )
 
-
-    if not train_paths or not val_paths:
+    if not train_paths:
         raise RuntimeError(
-            "Missing chess episodes"
+            "Missing training chess episodes"
         )
 
+    if (
+        not args.overfit_one
+        and not args.overfit_episode
+        and not val_paths
+    ):
+        raise RuntimeError(
+            "Missing validation chess episodes"
+        )
 
-    # Ensure no episode appears in both splits.
     train_names = {
-        path.name for path in train_paths
+        path.name
+        for path in train_paths
     }
-
-
     val_names = {
-        path.name for path in val_paths
+        path.name
+        for path in val_paths
     }
 
-
-    if train_names & val_names:
+    if (
+        val_paths
+        and train_names & val_names
+    ):
         raise RuntimeError(
             "Training and validation episodes overlap"
         )
 
-
     if args.overfit_episode:
-        if not 0 <= args.episode_index < len(train_paths):
-            raise ValueError("--episode-index is outside the training episode list")
-        train_paths = [train_paths[args.episode_index]]
-        print(f"Overfitting episode: {train_paths[0].name}", flush=True)
+        if not (
+            0
+            <= args.episode_index
+            < len(train_paths)
+        ):
+            raise ValueError(
+                "--episode-index is outside "
+                "the training episode list"
+            )
+
+        train_paths = [
+            train_paths[
+                args.episode_index
+            ]
+        ]
+
+        print(
+            f"Overfitting episode: "
+            f"{train_paths[0].name}",
+            flush=True,
+        )
+
+    # Augmentation is part of the real training pipeline, but deliberately
+    # disabled for memorization diagnostics.
+    train_augmentation = (
+        not args.no_augmentation
+        and not args.overfit_one
+        and not args.overfit_episode
+    )
+
+    print(
+        f"Training augmentation: "
+        f"{train_augmentation}",
+        flush=True,
+    )
 
     train_dataset = ChessDataset(
         episode_dirs=train_paths,
-        observation_horizon=2,
-        prediction_horizon=20,
-        load_images=True,
-        image_size=args.image_size,
-    )
-
-
-    val_dataset = ChessDataset(
-        episode_dirs=val_paths,
-        observation_horizon=2,
-        prediction_horizon=20,
-        stats=train_dataset.stats,
-        load_images=True,
-        image_size=args.image_size,
-    )
-
-
-    # Fixed, evenly spaced validation examples.
-    val_indices = np.linspace(
-        0,
-        len(val_dataset) - 1,
-        min(
-            args.val_samples,
-            len(val_dataset),
+        observation_horizon=(
+            DEFAULT_OBSERVATION_HORIZON
         ),
-        dtype=int,
-    ).tolist()
-
-
-    val_subset = Subset(
-        val_dataset,
-        val_indices,
+        prediction_horizon=(
+            DEFAULT_PREDICTION_HORIZON
+        ),
+        load_images=True,
+        image_size=args.image_size,
+        augment=train_augmentation,
+        validate_videos=True,
     )
 
-    train_samples = train_dataset
+    # Overfit diagnostics use the exact training data for validation.
     if args.overfit_one:
-        sample_index = len(train_dataset.episodes[0]["states"]) // 2
-        train_samples = Subset(train_dataset, [sample_index])
-        val_subset = Subset(train_dataset, [sample_index])
-        print(f"Overfitting sample index: {sample_index}", flush=True)
+        first_episode_dataset_indices = [
+            dataset_index
+            for dataset_index, (
+                episode_idx,
+                _
+            ) in enumerate(
+                train_dataset.indices
+            )
+            if episode_idx == 0
+        ]
+
+        if not first_episode_dataset_indices:
+            raise RuntimeError(
+                "First episode has no valid full-horizon sample"
+            )
+
+        sample_dataset_index = (
+            first_episode_dataset_indices[
+                len(
+                    first_episode_dataset_indices
+                )
+                // 2
+            ]
+        )
+
+        episode_idx, timestep = (
+            train_dataset.indices[
+                sample_dataset_index
+            ]
+        )
+
+        train_samples = Subset(
+            train_dataset,
+            [sample_dataset_index],
+        )
+        val_subset = Subset(
+            train_dataset,
+            [sample_dataset_index],
+        )
+
+        print(
+            f"Overfitting dataset sample "
+            f"{sample_dataset_index} "
+            f"(episode={episode_idx}, timestep={timestep})",
+            flush=True,
+        )
+
+        val_dataset = None
+
     elif args.overfit_episode:
-        # Evaluate on fixed windows from the SAME episode: this is a
-        # memorization diagnostic, not held-out validation.
+        train_samples = train_dataset
+
         indices = np.linspace(
-            0, len(train_dataset) - 1,
-            min(args.val_samples, len(train_dataset)),
+            0,
+            len(train_dataset) - 1,
+            min(
+                args.val_samples,
+                len(train_dataset),
+            ),
             dtype=int,
         ).tolist()
-        val_subset = Subset(train_dataset, indices)
-        print(f"Episode actions: {len(train_dataset)}", flush=True)
+
+        val_subset = Subset(
+            train_dataset,
+            indices,
+        )
+
+        print(
+            f"Episode training windows: "
+            f"{len(train_dataset)}",
+            flush=True,
+        )
+
+        val_dataset = None
+
+    else:
+        train_samples = train_dataset
+
+        val_dataset = ChessDataset(
+            episode_dirs=val_paths,
+            observation_horizon=(
+                train_dataset.observation_horizon
+            ),
+            prediction_horizon=(
+                train_dataset.prediction_horizon
+            ),
+            stats=train_dataset.stats,
+            load_images=True,
+            image_size=args.image_size,
+            augment=False,
+            validate_videos=True,
+        )
+
+        val_indices = np.linspace(
+            0,
+            len(val_dataset) - 1,
+            min(
+                args.val_samples,
+                len(val_dataset),
+            ),
+            dtype=int,
+        ).tolist()
+
+        val_subset = Subset(
+            val_dataset,
+            val_indices,
+        )
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(
+        args.seed
+    )
 
     train_loader = DataLoader(
         train_samples,
@@ -1472,8 +1937,8 @@ def train(args):
         pin_memory=(
             device.type == "cuda"
         ),
+        generator=loader_generator,
     )
-
 
     val_loader = DataLoader(
         val_subset,
@@ -1485,44 +1950,102 @@ def train(args):
         ),
     )
 
-
     print(
-        f"Training samples: {len(train_samples)}",
+        f"Training samples: "
+        f"{len(train_samples)}",
         flush=True,
     )
 
-
     print(
-        f"Fixed validation samples: {len(val_subset)}",
+        f"Fixed validation samples: "
+        f"{len(val_subset)}",
         flush=True,
     )
 
+    for key in REQUIRED_STAT_KEYS:
+        value = train_dataset.stats[key]
+        if not np.isfinite(value).all():
+            raise RuntimeError(
+                f"Non-finite training statistic: {key}"
+            )
 
-    # Checkpoint weights supersede ImageNet initialization.
+    print(
+        "Action range per dimension:",
+        flush=True,
+    )
+
+    if (
+        "action_min"
+        in train_dataset.stats
+        and "action_max"
+        in train_dataset.stats
+    ):
+        for index, (
+            low,
+            high,
+        ) in enumerate(
+            zip(
+                train_dataset.stats[
+                    "action_min"
+                ],
+                train_dataset.stats[
+                    "action_max"
+                ],
+            )
+        ):
+            print(
+                f"  action[{index:02d}] "
+                f"min={low:+.5f} "
+                f"max={high:+.5f}",
+                flush=True,
+            )
+
     use_pretrained = (
         not args.no_pretrained
         and args.resume is None
     )
 
-
     model = ChessDiffusionPolicy(
+        observation_horizon=(
+            train_dataset.observation_horizon
+        ),
+        prediction_horizon=(
+            train_dataset.prediction_horizon
+        ),
+        state_dim=DEFAULT_STATE_DIM,
+        action_dim=DEFAULT_ACTION_DIM,
+        vision_feature_dim=(
+            DEFAULT_VISION_FEATURE_DIM
+        ),
         pretrained_vision=use_pretrained,
         freeze_backbone=True,
+        num_diffusion_steps=(
+            DEFAULT_DIFFUSION_STEPS
+        ),
+        noise_schedule=(
+            DEFAULT_NOISE_SCHEDULE
+        ),
+        diffusion_step_embed_dim=(
+            DEFAULT_DIFFUSION_STEP_EMBED_DIM
+        ),
+        unet_down_dims=(
+            DEFAULT_UNET_DOWN_DIMS
+        ),
+        unet_kernel_size=(
+            DEFAULT_UNET_KERNEL_SIZE
+        ),
+        unet_n_groups=(
+            DEFAULT_UNET_N_GROUPS
+        ),
     ).to(device)
-
 
     ema_model = copy.deepcopy(
         model
     )
-
-
     ema_model.requires_grad_(
         False
     )
-
-
     ema_model.eval()
-
 
     optimizer = torch.optim.AdamW(
         (
@@ -1534,7 +2057,6 @@ def train(args):
         weight_decay=1e-6,
     )
 
-
     lr_scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -1542,38 +2064,87 @@ def train(args):
         )
     )
 
-
     config = {
         "task": TASK_NAME,
-        "observation_horizon": 2,
-        "prediction_horizon": 20,
-        "state_dim": 14,
-        "action_dim": 14,
         "camera_keys": CAMERA_KEYS,
-        "image_size": args.image_size,
-        "vision_feature_dim": 128,
+        "image_size": int(
+            args.image_size
+        ),
+        "observation_horizon": int(
+            train_dataset.observation_horizon
+        ),
+        "prediction_horizon": int(
+            train_dataset.prediction_horizon
+        ),
+        "state_dim": DEFAULT_STATE_DIM,
+        "action_dim": DEFAULT_ACTION_DIM,
+        "vision_feature_dim":
+            DEFAULT_VISION_FEATURE_DIM,
         "freeze_backbone": True,
         "pretrained_vision": (
             not args.no_pretrained
         ),
-        "num_diffusion_steps": 100,
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "total_steps": args.steps,
-        "ema_decay": args.ema_decay,
-        "seed": args.seed,
-        "val_samples": args.val_samples,
-        "val_seed": args.val_seed,
-        "overfit_one": args.overfit_one,
-        "overfit_episode": args.overfit_episode,
-        "overfit_episode_name": train_paths[0].name if args.overfit_episode else None,
-        "episode_index": args.episode_index if args.overfit_episode else None,
+        "num_diffusion_steps":
+            DEFAULT_DIFFUSION_STEPS,
+        "noise_schedule":
+            DEFAULT_NOISE_SCHEDULE,
+        "diffusion_step_embed_dim":
+            DEFAULT_DIFFUSION_STEP_EMBED_DIM,
+        "unet_down_dims":
+            tuple(
+                DEFAULT_UNET_DOWN_DIMS
+            ),
+        "unet_kernel_size":
+            DEFAULT_UNET_KERNEL_SIZE,
+        "unet_n_groups":
+            DEFAULT_UNET_N_GROUPS,
+        "batch_size": int(
+            args.batch_size
+        ),
+        "learning_rate": float(
+            args.lr
+        ),
+        "total_steps": int(
+            args.steps
+        ),
+        "ema_decay": float(
+            args.ema_decay
+        ),
+        "seed": int(
+            args.seed
+        ),
+        "val_samples": int(
+            args.val_samples
+        ),
+        "val_seed": int(
+            args.val_seed
+        ),
+        "sample_val_seed": int(
+            args.sample_val_seed
+        ),
+        "train_augmentation": bool(
+            train_augmentation
+        ),
+        "overfit_one": bool(
+            args.overfit_one
+        ),
+        "overfit_episode": bool(
+            args.overfit_episode
+        ),
+        "overfit_episode_name": (
+            train_paths[0].name
+            if args.overfit_episode
+            else None
+        ),
+        "episode_index": (
+            int(args.episode_index)
+            if args.overfit_episode
+            else None
+        ),
     }
-
 
     start_step = 0
     best_val = float("inf")
-
 
     if args.resume is not None:
         checkpoint = torch.load(
@@ -1582,44 +2153,62 @@ def train(args):
             weights_only=False,
         )
 
+        saved_config = checkpoint[
+            "config"
+        ]
 
-        saved_config = (
-            checkpoint["config"]
-        )
-
-
-        for key in (
+        strict_resume_keys = (
             "task",
+            "camera_keys",
             "image_size",
             "observation_horizon",
             "prediction_horizon",
+            "state_dim",
+            "action_dim",
             "vision_feature_dim",
+            "freeze_backbone",
+            "pretrained_vision",
+            "num_diffusion_steps",
+            "noise_schedule",
+            "diffusion_step_embed_dim",
+            "unet_down_dims",
+            "unet_kernel_size",
+            "unet_n_groups",
+            "batch_size",
+            "learning_rate",
             "total_steps",
+            "ema_decay",
+            "seed",
             "val_samples",
             "val_seed",
+            "sample_val_seed",
+            "train_augmentation",
             "overfit_one",
             "overfit_episode",
             "overfit_episode_name",
             "episode_index",
-        ):
+        )
+
+        for key in strict_resume_keys:
             if (
-                key in saved_config
-                and saved_config[key] != config[key]
+                key not in saved_config
+                or saved_config[key]
+                != config[key]
             ):
                 raise ValueError(
-                    f"Resume configuration mismatch: "
-                    f"{key}"
+                    f"Resume configuration mismatch: {key}. "
+                    f"saved={saved_config.get(key)!r}, "
+                    f"current={config.get(key)!r}"
                 )
 
-
-        # Verify training normalization has not changed.
-        for key, original in (
-            checkpoint["stats"].items()
-        ):
-            current = (
-                train_dataset.stats[key]
+        for key in REQUIRED_STAT_KEYS:
+            original = np.asarray(
+                checkpoint["stats"][key],
+                dtype=np.float32,
             )
-
+            current = train_dataset.stats[
+                key
+            ]
 
             if not np.allclose(
                 original,
@@ -1631,37 +2220,30 @@ def train(args):
                     f"Normalization mismatch: {key}"
                 )
 
-
         model.load_state_dict(
-            checkpoint["model"]
+            checkpoint["model"],
+            strict=True,
         )
-
-
         ema_model.load_state_dict(
-            checkpoint["ema"]
+            checkpoint["ema"],
+            strict=True,
         )
-
-
         optimizer.load_state_dict(
             checkpoint["optimizer"]
         )
-
-
         lr_scheduler.load_state_dict(
             checkpoint["lr_scheduler"]
         )
 
-
         start_step = int(
             checkpoint["step"]
         )
-
-
-        best_val = checkpoint.get(
-            "best_val",
-            float("inf"),
+        best_val = float(
+            checkpoint.get(
+                "best_val",
+                float("inf"),
+            )
         )
-
 
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(
@@ -1670,10 +2252,10 @@ def train(args):
                 ].cpu()
             )
 
-
         if (
             device.type == "cuda"
-            and "cuda_rng_state" in checkpoint
+            and "cuda_rng_state"
+            in checkpoint
         ):
             torch.cuda.set_rng_state_all(
                 checkpoint[
@@ -1681,22 +2263,20 @@ def train(args):
                 ]
             )
 
-
         print(
-            f"Resumed from step {start_step}",
+            f"Resumed from step "
+            f"{start_step}",
             flush=True,
         )
 
-
-
-
     model.train()
-
 
     train_iterator = iter(
         train_loader
     )
 
+    running_loss_sum = 0.0
+    running_loss_count = 0
 
     for step in range(
         start_step,
@@ -1707,63 +2287,44 @@ def train(args):
                 train_iterator
             )
 
-
         except StopIteration:
             train_iterator = iter(
                 train_loader
             )
-
-
             batch = next(
                 train_iterator
             )
-
 
         states = batch["states"].to(
             device,
             non_blocking=True,
         )
-
-
         images = batch["images"].to(
             device,
             non_blocking=True,
         )
-
-
         actions = batch["actions"].to(
             device,
             non_blocking=True,
         )
 
-
-        is_pad = batch["is_pad"].to(
-            device,
-            non_blocking=True,
-        )
-
-
         optimizer.zero_grad(
             set_to_none=True
         )
-
 
         loss = model(
             states,
             images,
             actions,
-            is_pad,
         )
-
 
         if not torch.isfinite(loss):
             raise RuntimeError(
-                f"Non-finite loss at step {step + 1}"
+                f"Non-finite loss at "
+                f"step {step + 1}"
             )
 
-
         loss.backward()
-
 
         grad_norm = (
             torch.nn.utils.clip_grad_norm_(
@@ -1777,12 +2338,8 @@ def train(args):
             )
         )
 
-
         optimizer.step()
-
-
         lr_scheduler.step()
-
 
         update_ema(
             ema_model,
@@ -1790,37 +2347,57 @@ def train(args):
             decay=args.ema_decay,
         )
 
-
         completed_step = (
             step + 1
         )
 
-
-
+        running_loss_sum += float(
+            loss.item()
+        )
+        running_loss_count += 1
 
         if (
             completed_step == 1
-            or completed_step % args.log_every == 0
+            or completed_step
+            % args.log_every
+            == 0
         ):
+            running_mean = (
+                running_loss_sum
+                / max(
+                    running_loss_count,
+                    1,
+                )
+            )
+
             print(
                 f"Step {completed_step}/{args.steps} | "
                 f"Loss {loss.item():.5f} | "
+                f"Running {running_mean:.5f} | "
                 f"Grad {grad_norm.item():.3f} | "
-                f"LR {optimizer.param_groups[0]['lr']:.2e}",
+                f"LR "
+                f"{optimizer.param_groups[0]['lr']:.2e}",
                 flush=True,
             )
 
-
-
-
         should_validate = (
-            completed_step % args.val_every == 0
-            or completed_step == args.steps
+            completed_step
+            % args.val_every
+            == 0
+            or completed_step
+            == args.steps
         )
 
-
         if should_validate:
-            val_loss = validate(
+            mean_train_loss = (
+                running_loss_sum
+                / max(
+                    running_loss_count,
+                    1,
+                )
+            )
+
+            val_loss = validate_noise_loss(
                 model=ema_model,
                 val_loader=val_loader,
                 device=device,
@@ -1828,21 +2405,32 @@ def train(args):
                 seed=args.val_seed,
             )
 
+            sample_metrics = (
+                validate_generated_actions(
+                    model=ema_model,
+                    val_loader=val_loader,
+                    stats=train_dataset.stats,
+                    device=device,
+                    max_batches=(
+                        args.sample_val_batches
+                    ),
+                    seed=(
+                        args.sample_val_seed
+                    ),
+                )
+            )
 
             improved = (
                 val_loss < best_val
             )
 
-
             if improved:
-                best_val = (
-                    val_loss
-                )
-
+                best_val = val_loss
 
                 save_training_checkpoint(
                     path=(
-                        args.output / "best.pt"
+                        args.output
+                        / "best.pt"
                     ),
                     step=completed_step,
                     model=model,
@@ -1854,20 +2442,25 @@ def train(args):
                     best_val=best_val,
                 )
 
-
             record = {
                 "step": completed_step,
-                "train_loss": loss.item(),
-                "val_loss": val_loss,
-                "best_val_loss": best_val,
+                "train_loss_mean":
+                    mean_train_loss,
+                "val_noise_loss":
+                    val_loss,
+                "best_val_noise_loss":
+                    best_val,
+                **sample_metrics,
                 "learning_rate": (
-                    optimizer.param_groups[0]["lr"]
+                    optimizer.param_groups[
+                        0
+                    ]["lr"]
                 ),
                 "elapsed_seconds": (
-                    time.monotonic() - started
+                    time.monotonic()
+                    - started
                 ),
             }
-
 
             with metrics_path.open(
                 "a"
@@ -1877,26 +2470,63 @@ def train(args):
                     + "\n"
                 )
 
-
             print(
-                f"Validation: {val_loss:.5f} | "
-                f"Best: {best_val:.5f} | "
+                f"Validation noise: "
+                f"{val_loss:.6f} | "
+                f"Best: {best_val:.6f} | "
                 f"New best: {improved}",
                 flush=True,
             )
 
+            print(
+                f"Generated chunk normalized MSE: "
+                f"{sample_metrics['sample_normalized_mse']:.6f} | "
+                f"action-unit MSE: "
+                f"{sample_metrics['sample_action_mse']:.6f}",
+                flush=True,
+            )
+
+            print(
+                f"Generated action range: "
+                f"[{sample_metrics['sample_prediction_min']:+.5f}, "
+                f"{sample_metrics['sample_prediction_max']:+.5f}] | "
+                f"target range: "
+                f"[{sample_metrics['sample_target_min']:+.5f}, "
+                f"{sample_metrics['sample_target_max']:+.5f}]",
+                flush=True,
+            )
+
+            if (
+                args.overfit_one
+                or args.overfit_episode
+            ):
+                formatted = ", ".join(
+                    f"{value:.6g}"
+                    for value in sample_metrics[
+                        "sample_action_mse_per_dim"
+                    ]
+                )
+
+                print(
+                    f"Per-dimension action MSE: "
+                    f"[{formatted}]",
+                    flush=True,
+                )
+
+            running_loss_sum = 0.0
+            running_loss_count = 0
 
             model.train()
 
-
         if (
-            completed_step % args.save_every == 0
+            completed_step
+            % args.save_every
+            == 0
         ):
             checkpoint_path = (
                 args.output
                 / f"step_{completed_step}.pt"
             )
-
 
             save_training_checkpoint(
                 path=checkpoint_path,
@@ -1910,19 +2540,14 @@ def train(args):
                 best_val=best_val,
             )
 
-
             print(
                 f"Saved: {checkpoint_path}",
                 flush=True,
             )
 
-
-
-
     final_path = (
         args.output / "final.pt"
     )
-
 
     save_training_checkpoint(
         path=final_path,
@@ -1936,9 +2561,9 @@ def train(args):
         best_val=best_val,
     )
 
-
     print(
-        f"TRAINING COMPLETE: {final_path}",
+        f"TRAINING COMPLETE: "
+        f"{final_path}",
         flush=True,
     )
 
@@ -1950,13 +2575,11 @@ def main():
         )
     )
 
-
     parser.add_argument(
         "--mode",
         choices=("train",),
         default="train",
     )
-
 
     parser.add_argument(
         "--abc-dir",
@@ -1967,13 +2590,11 @@ def main():
         ),
     )
 
-
     parser.add_argument(
         "--steps",
         type=int,
         default=10000,
     )
-
 
     parser.add_argument(
         "--batch-size",
@@ -1981,13 +2602,11 @@ def main():
         default=16,
     )
 
-
     parser.add_argument(
         "--lr",
         type=float,
         default=1e-4,
     )
-
 
     parser.add_argument(
         "--image-size",
@@ -1995,13 +2614,11 @@ def main():
         default=224,
     )
 
-
     parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
     )
-
 
     parser.add_argument(
         "--val-every",
@@ -2009,13 +2626,21 @@ def main():
         default=500,
     )
 
-
     parser.add_argument(
         "--val-batches",
         type=int,
         default=20,
     )
 
+    parser.add_argument(
+        "--sample-val-batches",
+        type=int,
+        default=1,
+        help=(
+            "Number of validation batches on which "
+            "to run full reverse diffusion"
+        ),
+    )
 
     parser.add_argument(
         "--val-samples",
@@ -2023,13 +2648,17 @@ def main():
         default=128,
     )
 
-
     parser.add_argument(
         "--val-seed",
         type=int,
         default=12345,
     )
 
+    parser.add_argument(
+        "--sample-val-seed",
+        type=int,
+        default=54321,
+    )
 
     parser.add_argument(
         "--save-every",
@@ -2037,13 +2666,11 @@ def main():
         default=1000,
     )
 
-
     parser.add_argument(
         "--log-every",
         type=int,
         default=20,
     )
-
 
     parser.add_argument(
         "--ema-decay",
@@ -2051,13 +2678,11 @@ def main():
         default=0.995,
     )
 
-
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
     )
-
 
     parser.add_argument(
         "--output",
@@ -2067,13 +2692,20 @@ def main():
         ),
     )
 
-
     parser.add_argument(
         "--resume",
         type=Path,
         default=None,
     )
 
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help=(
+            "Delete old chess training artifacts "
+            "inside --output before a fresh run"
+        ),
+    )
 
     parser.add_argument(
         "--overfit-one",
@@ -2083,14 +2715,30 @@ def main():
     parser.add_argument(
         "--overfit-episode",
         action="store_true",
-        help="Train on all windows from one training demonstration",
+        help=(
+            "Train on all full action windows "
+            "from one training demonstration"
+        ),
     )
 
     parser.add_argument(
         "--episode-index",
         type=int,
         default=0,
-        help="Index in the sorted training episode list (default: 0)",
+        help=(
+            "Index in the sorted training "
+            "episode list"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-augmentation",
+        action="store_true",
+        help=(
+            "Disable image augmentation for normal training. "
+            "Augmentation is always disabled automatically "
+            "for overfit diagnostics."
+        ),
     )
 
     parser.add_argument(
@@ -2102,14 +2750,10 @@ def main():
         ),
     )
 
-
     args = parser.parse_args()
-
 
     if args.mode == "train":
         train(args)
-
-
 
 
 if __name__ == "__main__":
