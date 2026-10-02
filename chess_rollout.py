@@ -3,6 +3,8 @@ import json
 import os
 from collections import deque
 from pathlib import Path
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -128,6 +130,12 @@ def top_frame(observation):
 
 
 def json_safe(value):
+    if value is None or isinstance(
+        value,
+        (str, int, float, bool),
+    ):
+        return value
+
     if isinstance(
         value,
         np.ndarray,
@@ -139,6 +147,27 @@ def json_safe(value):
         np.generic,
     ):
         return value.item()
+
+    if isinstance(
+        value,
+        Path,
+    ):
+        return str(value)
+
+    if isinstance(
+        value,
+        Enum,
+    ):
+        return json_safe(
+            value.value
+        )
+
+    if is_dataclass(
+        value
+    ):
+        return json_safe(
+            asdict(value)
+        )
 
     if isinstance(
         value,
@@ -158,7 +187,17 @@ def json_safe(value):
             for v in value
         ]
 
-    return value
+    if hasattr(
+        value,
+        "__dict__",
+    ):
+        return {
+            str(k): json_safe(v)
+            for k, v in vars(value).items()
+            if not str(k).startswith("_")
+        }
+
+    return str(value)
 
 
 def make_plot(
@@ -1419,7 +1458,7 @@ def run_episode(
 
         trace_path.write_text(
             json.dumps(
-                trace,
+                json_safe(trace),
                 indent=2,
             )
             + "\n"
@@ -1526,7 +1565,7 @@ def run_episode(
 
         print(
             json.dumps(
-                result,
+                json_safe(result),
                 indent=2,
             ),
             flush=True,
@@ -1733,7 +1772,7 @@ def main():
             / "summary.json"
         ).write_text(
             json.dumps(
-                summary,
+                json_safe(summary),
                 indent=2,
             )
             + "\n"
