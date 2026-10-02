@@ -14,6 +14,7 @@ import abc_sim
 from chess_dp import (
     CAMERA_KEYS,
     ChessDiffusionPolicy,
+    denormalize_actions_array,
     preprocess_rgb_image,
 )
 
@@ -519,6 +520,10 @@ def load_policy(
         "unet_down_dims",
         "unet_kernel_size",
         "unet_n_groups",
+        "action_normalization",
+        "action_range_eps",
+        "clip_sample",
+        "clip_sample_range",
     )
 
     for key in required_config:
@@ -583,6 +588,8 @@ def load_policy(
         "state_std",
         "action_mean",
         "action_std",
+        "action_min",
+        "action_max",
     ):
         if key not in stats:
             raise KeyError(
@@ -602,6 +609,15 @@ def load_policy(
         raise ValueError(
             "Invalid action_std in checkpoint"
         )
+
+    if config["action_normalization"] != "limits_-1_1":
+        raise ValueError(
+            "This rollout requires bounded limits_-1_1 action normalization; "
+            f"checkpoint has {config['action_normalization']!r}"
+        )
+
+    if np.any(stats["action_max"] < stats["action_min"]):
+        raise ValueError("Invalid action_min/action_max in checkpoint")
 
     model = ChessDiffusionPolicy(
         observation_horizon=int(
@@ -665,6 +681,16 @@ def load_policy(
                 "unet_n_groups"
             ]
         ),
+        clip_sample=bool(
+            config[
+                "clip_sample"
+            ]
+        ),
+        clip_sample_range=float(
+            config[
+                "clip_sample_range"
+            ]
+        ),
     ).to(
         device
     )
@@ -674,6 +700,9 @@ def load_policy(
         strict=True,
     )
 
+    model.action_range_eps = float(
+        config["action_range_eps"]
+    )
     model.eval()
 
     if model.action_dim != 14:
@@ -809,14 +838,10 @@ def predict_chunk(
             "contain NaN/Inf"
         )
 
-    actions = (
-        actions
-        * stats[
-            "action_std"
-        ]
-        + stats[
-            "action_mean"
-        ]
+    actions = denormalize_actions_array(
+        actions,
+        stats,
+        range_eps=float(model.action_range_eps),
     )
 
     if not np.isfinite(
@@ -832,66 +857,95 @@ def predict_chunk(
     )
 
 
+def get_policy_action_safety_bounds(env):
+    """Return policy-space safety bounds matching ABC's control semantics.
+
+    Arm actions are absolute MuJoCo actuator targets, so they are NOT globally
+    restricted to [-1, 1]. Grippers are policy-space [0, 1]. For arm joints we
+    use the actual MuJoCo actuator ctrlrange when the actuator declares one.
+    """
+    low = np.full(14, -np.inf, dtype=np.float32)
+    high = np.full(14, np.inf, dtype=np.float32)
+
+    ctrl_indices = getattr(env, "_ctrl_indices", None)
+    gripper_set = set(getattr(env, "_gripper_set", {6, 13}))
+
+    if ctrl_indices is not None and len(ctrl_indices) == 14:
+        ctrlrange = np.asarray(
+            env.model.actuator_ctrlrange,
+            dtype=np.float32,
+        )
+        ctrllimited = np.asarray(
+            env.model.actuator_ctrllimited,
+            dtype=bool,
+        )
+
+        for policy_index, actuator_index in enumerate(ctrl_indices):
+            if policy_index in gripper_set:
+                continue
+            actuator_index = int(actuator_index)
+            if ctrllimited[actuator_index]:
+                low[policy_index] = ctrlrange[actuator_index, 0]
+                high[policy_index] = ctrlrange[actuator_index, 1]
+
+    low[[6, 13]] = 0.0
+    high[[6, 13]] = 1.0
+
+    if np.any(high < low):
+        raise RuntimeError("Invalid simulator action safety bounds")
+
+    return low, high
+
+
 def sanitize_action(
     action,
+    safety_low,
+    safety_high,
 ):
-    """
-    Final safety boundary before env.step().
+    """Final physical safety boundary before env.step().
 
-    ABC policy actions are bounded to [-1, 1]. Gripper commands in this policy
-    use [0, 1]. We do NOT clamp the model output earlier, because we want the
-    diagnostics to reveal when the model is predicting bad values.
+    The model's bounded diffusion normalization already guarantees predictions
+    remain inside the training action limits. This additional clamp protects the
+    simulator using its real actuator bounds instead of the misleading global
+    Gym Box [-1, 1] declaration for arm joint targets.
     """
     action = np.asarray(
         action,
         dtype=np.float32,
     )
+    safety_low = np.asarray(
+        safety_low,
+        dtype=np.float32,
+    )
+    safety_high = np.asarray(
+        safety_high,
+        dtype=np.float32,
+    )
 
     if action.shape != (14,):
         raise ValueError(
-            f"Expected action shape (14,), "
-            f"got {action.shape}"
+            f"Expected action shape (14,), got {action.shape}"
         )
-
-    if not np.isfinite(
-        action
-    ).all():
+    if safety_low.shape != (14,) or safety_high.shape != (14,):
+        raise ValueError("Safety bounds must each have shape (14,)")
+    if not np.isfinite(action).all():
         raise RuntimeError(
-            "Refusing to execute action "
-            "containing NaN/Inf"
+            "Refusing to execute action containing NaN/Inf"
         )
 
-    sanitized = np.clip(
-        action,
-        -1.0,
-        1.0,
-    )
-
-    sanitized[
-        [6, 13]
-    ] = np.clip(
-        sanitized[
-            [6, 13]
-        ],
-        0.0,
-        1.0,
+    sanitized = np.minimum(
+        np.maximum(action, safety_low),
+        safety_high,
     )
 
     clipped_values = int(
         np.count_nonzero(
-            np.abs(
-                sanitized
-                - action
-            )
-            > 1e-7
+            np.abs(sanitized - action) > 1e-7
         )
     )
 
     return (
-        sanitized.astype(
-            np.float32,
-            copy=False,
-        ),
+        sanitized.astype(np.float32, copy=False),
         clipped_values,
     )
 
@@ -969,6 +1023,31 @@ def run_episode(
         max_episode_steps=args.max_actions,
         terminate_on_success=True,
     )
+
+    safety_low, safety_high = get_policy_action_safety_bounds(env)
+
+    print(
+        "Rollout safety bounds (finite dimensions): "
+        + ", ".join(
+            f"{i}:[{safety_low[i]:+.3f},{safety_high[i]:+.3f}]"
+            for i in range(14)
+            if np.isfinite(safety_low[i]) or np.isfinite(safety_high[i])
+        ),
+        flush=True,
+    )
+
+    # The bounded action normalizer should fit entirely inside the physical
+    # safety envelope. Fail early if the dataset/checkpoint disagrees.
+    below = stats["action_min"] < safety_low
+    above = stats["action_max"] > safety_high
+    if np.any(below | above):
+        bad = np.flatnonzero(below | above).tolist()
+        env.close()
+        raise RuntimeError(
+            "Training action limits exceed simulator actuator safety bounds "
+            f"for dimensions {bad}. Refusing rollout rather than silently clip "
+            "valid demonstrations."
+        )
 
     writer = None
 
@@ -1122,7 +1201,9 @@ def run_episode(
 
                 action, clipped_values = (
                     sanitize_action(
-                        raw_action
+                        raw_action,
+                        safety_low,
+                        safety_high,
                     )
                 )
 

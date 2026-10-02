@@ -32,19 +32,22 @@ DEFAULT_DIFFUSION_STEP_EMBED_DIM = 128
 DEFAULT_UNET_DOWN_DIMS = (128, 256, 512)
 DEFAULT_UNET_KERNEL_SIZE = 5
 DEFAULT_UNET_N_GROUPS = 8
+DEFAULT_ACTION_RANGE_EPS = 1e-4
+DEFAULT_CLIP_SAMPLE = True
+DEFAULT_CLIP_SAMPLE_RANGE = 1.0
 
 REQUIRED_STAT_KEYS = (
     "state_mean",
     "state_std",
     "action_mean",
     "action_std",
+    "action_min",
+    "action_max",
 )
 
 OPTIONAL_STAT_KEYS = (
     "state_min",
     "state_max",
-    "action_min",
-    "action_max",
 )
 
 
@@ -353,12 +356,44 @@ def normalize_states_array(states, stats):
     ) / stats["state_std"]
 
 
-def denormalize_actions_array(actions, stats):
+def normalize_actions_array(actions, stats, range_eps=DEFAULT_ACTION_RANGE_EPS):
+    """Map training action limits to [-1, 1] per dimension.
+
+    Diffusion sampling is substantially more stable when the variable being
+    diffused lives in a known bounded range. Constant/near-constant dimensions
+    map to exactly zero.
+    """
     actions = np.asarray(actions, dtype=np.float32)
-    return (
-        actions * stats["action_std"]
-        + stats["action_mean"]
-    )
+    action_min = np.asarray(stats["action_min"], dtype=np.float32)
+    action_max = np.asarray(stats["action_max"], dtype=np.float32)
+    span = action_max - action_min
+    constant = span < float(range_eps)
+    safe_span = np.where(constant, 1.0, span).astype(np.float32)
+    normalized = 2.0 * (actions - action_min) / safe_span - 1.0
+    if np.any(constant):
+        normalized[..., constant] = 0.0
+    if not np.isfinite(normalized).all():
+        raise ValueError("Normalized actions contain NaN/Inf")
+    return normalized.astype(np.float32, copy=False)
+
+
+def denormalize_actions_array(actions, stats, range_eps=DEFAULT_ACTION_RANGE_EPS):
+    """Invert normalize_actions_array.
+
+    Inputs are clipped to [-1, 1], so a sampled action can never denormalize
+    beyond the training action limits. Constant dimensions return the recorded
+    constant value exactly.
+    """
+    actions = np.asarray(actions, dtype=np.float32)
+    action_min = np.asarray(stats["action_min"], dtype=np.float32)
+    action_max = np.asarray(stats["action_max"], dtype=np.float32)
+    span = action_max - action_min
+    constant = span < float(range_eps)
+    clipped = np.clip(actions, -1.0, 1.0)
+    restored = action_min + 0.5 * (clipped + 1.0) * span
+    if np.any(constant):
+        restored[..., constant] = action_min[constant]
+    return restored.astype(np.float32, copy=False)
 
 
 class ChessDataset(Dataset):
@@ -603,10 +638,10 @@ class ChessDataset(Dataset):
             self.stats,
         )
 
-        action_sequence = (
-            actions[action_indices]
-            - self.action_mean
-        ) / self.action_std
+        action_sequence = normalize_actions_array(
+            actions[action_indices],
+            self.stats,
+        )
 
         sample = {
             "states": torch.from_numpy(
@@ -650,23 +685,27 @@ class ChessDataset(Dataset):
 
     def denormalize_actions(self, actions):
         if isinstance(actions, torch.Tensor):
-            mean = torch.as_tensor(
-                self.action_mean,
+            action_min = torch.as_tensor(
+                self.stats["action_min"],
                 device=actions.device,
                 dtype=actions.dtype,
             )
-
-            std = torch.as_tensor(
-                self.action_std,
+            action_max = torch.as_tensor(
+                self.stats["action_max"],
                 device=actions.device,
                 dtype=actions.dtype,
             )
+            span = action_max - action_min
+            constant = span < DEFAULT_ACTION_RANGE_EPS
+            clipped = actions.clamp(-1.0, 1.0)
+            restored = action_min + 0.5 * (clipped + 1.0) * span
+            if bool(constant.any()):
+                restored[..., constant] = action_min[constant]
+            return restored
 
-            return actions * std + mean
-
-        return (
-            actions * self.action_std
-            + self.action_mean
+        return denormalize_actions_array(
+            actions,
+            self.stats,
         )
 
 
@@ -677,6 +716,8 @@ class DDPMScheduler(nn.Module):
         beta_start=1e-4,
         beta_end=0.02,
         schedule=DEFAULT_NOISE_SCHEDULE,
+        clip_sample=DEFAULT_CLIP_SAMPLE,
+        clip_sample_range=DEFAULT_CLIP_SAMPLE_RANGE,
     ):
         super().__init__()
 
@@ -685,6 +726,10 @@ class DDPMScheduler(nn.Module):
 
         self.num_train_steps = int(num_train_steps)
         self.schedule = str(schedule)
+        self.clip_sample = bool(clip_sample)
+        self.clip_sample_range = float(clip_sample_range)
+        if self.clip_sample_range <= 0:
+            raise ValueError("clip_sample_range must be positive")
 
         if schedule == "linear":
             betas = torch.linspace(
@@ -819,6 +864,17 @@ class DDPMScheduler(nn.Module):
             * predicted_noise
         ) / alpha_bar_t.sqrt()
 
+        if not torch.isfinite(predicted_x0).all():
+            raise RuntimeError(
+                f"Non-finite predicted x0 at diffusion timestep {t}"
+            )
+
+        if self.clip_sample:
+            predicted_x0 = predicted_x0.clamp(
+                -self.clip_sample_range,
+                self.clip_sample_range,
+            )
+
         coefficient_x0 = (
             alpha_bar_prev.sqrt()
             * beta_t
@@ -880,6 +936,11 @@ class DDPMScheduler(nn.Module):
                 condition,
             )
 
+            if not torch.isfinite(predicted_noise).all():
+                raise RuntimeError(
+                    f"Denoiser produced NaN/Inf at diffusion timestep {t}"
+                )
+
             if predicted_noise.shape != actions.shape:
                 raise RuntimeError(
                     f"Denoiser returned {predicted_noise.shape}; "
@@ -890,6 +951,15 @@ class DDPMScheduler(nn.Module):
                 predicted_noise,
                 t,
                 actions,
+            )
+
+        if not torch.isfinite(actions).all():
+            raise RuntimeError("Final sampled actions contain NaN/Inf")
+
+        if self.clip_sample:
+            actions = actions.clamp(
+                -self.clip_sample_range,
+                self.clip_sample_range,
             )
 
         return actions
@@ -1031,6 +1101,8 @@ class ChessDiffusionPolicy(nn.Module):
         unet_down_dims=DEFAULT_UNET_DOWN_DIMS,
         unet_kernel_size=DEFAULT_UNET_KERNEL_SIZE,
         unet_n_groups=DEFAULT_UNET_N_GROUPS,
+        clip_sample=DEFAULT_CLIP_SAMPLE,
+        clip_sample_range=DEFAULT_CLIP_SAMPLE_RANGE,
     ):
         super().__init__()
 
@@ -1093,6 +1165,12 @@ class ChessDiffusionPolicy(nn.Module):
             ),
             schedule=str(
                 noise_schedule
+            ),
+            clip_sample=bool(
+                clip_sample
+            ),
+            clip_sample_range=float(
+                clip_sample_range
             ),
         )
 
@@ -1393,17 +1471,19 @@ def validate_generated_actions(
     """
     model.eval()
 
-    action_mean = torch.as_tensor(
-        stats["action_mean"],
+    action_min = torch.as_tensor(
+        stats["action_min"],
         device=device,
         dtype=torch.float32,
     ).view(1, 1, -1)
 
-    action_std = torch.as_tensor(
-        stats["action_std"],
+    action_max = torch.as_tensor(
+        stats["action_max"],
         device=device,
         dtype=torch.float32,
     ).view(1, 1, -1)
+    action_span = action_max - action_min
+    constant_action_dim = action_span < DEFAULT_ACTION_RANGE_EPS
 
     total_norm_sq = 0.0
     total_action_sq = 0.0
@@ -1420,6 +1500,8 @@ def validate_generated_actions(
     prediction_max = float("-inf")
     target_min = float("inf")
     target_max = float("-inf")
+    normalized_prediction_min = float("inf")
+    normalized_prediction_max = float("-inf")
 
     cuda_devices = (
         [torch.cuda.current_device()]
@@ -1467,18 +1549,36 @@ def validate_generated_actions(
                     "Generated actions contain NaN/Inf"
                 )
 
+            normalized_prediction_min = min(
+                normalized_prediction_min,
+                float(prediction.min().item()),
+            )
+            normalized_prediction_max = max(
+                normalized_prediction_max,
+                float(prediction.max().item()),
+            )
+
             normalized_error = (
                 prediction - target
             ).square()
 
+            prediction_clipped = prediction.clamp(-1.0, 1.0)
+            target_clipped = target.clamp(-1.0, 1.0)
             prediction_actions = (
-                prediction * action_std
-                + action_mean
+                action_min
+                + 0.5 * (prediction_clipped + 1.0) * action_span
             )
             target_actions = (
-                target * action_std
-                + action_mean
+                action_min
+                + 0.5 * (target_clipped + 1.0) * action_span
             )
+            if bool(constant_action_dim.any()):
+                prediction_actions[..., constant_action_dim.view(-1)] = (
+                    action_min.view(-1)[constant_action_dim.view(-1)]
+                )
+                target_actions[..., constant_action_dim.view(-1)] = (
+                    action_min.view(-1)[constant_action_dim.view(-1)]
+                )
 
             action_error = (
                 prediction_actions
@@ -1553,6 +1653,10 @@ def validate_generated_actions(
             target_min,
         "sample_target_max":
             target_max,
+        "sample_normalized_prediction_min":
+            normalized_prediction_min,
+        "sample_normalized_prediction_max":
+            normalized_prediction_max,
     }
 
 
@@ -1565,7 +1669,8 @@ def save_training_checkpoint(
     lr_scheduler,
     stats,
     config,
-    best_val,
+    best_metric,
+    best_metric_name,
 ):
     path = Path(path)
 
@@ -1586,7 +1691,10 @@ def save_training_checkpoint(
             for key, value in stats.items()
         },
         "config": config,
-        "best_val": float(best_val),
+        "best_metric": float(best_metric),
+        "best_metric_name": str(best_metric_name),
+        # Kept for convenient inspection by older local utilities.
+        "best_val": float(best_metric),
         "torch_rng_state":
             torch.get_rng_state(),
     }
@@ -2037,6 +2145,10 @@ def train(args):
         unet_n_groups=(
             DEFAULT_UNET_N_GROUPS
         ),
+        clip_sample=DEFAULT_CLIP_SAMPLE,
+        clip_sample_range=(
+            DEFAULT_CLIP_SAMPLE_RANGE
+        ),
     ).to(device)
 
     ema_model = copy.deepcopy(
@@ -2098,6 +2210,19 @@ def train(args):
             DEFAULT_UNET_KERNEL_SIZE,
         "unet_n_groups":
             DEFAULT_UNET_N_GROUPS,
+        "action_normalization":
+            "limits_-1_1",
+        "action_range_eps":
+            DEFAULT_ACTION_RANGE_EPS,
+        "clip_sample":
+            DEFAULT_CLIP_SAMPLE,
+        "clip_sample_range":
+            DEFAULT_CLIP_SAMPLE_RANGE,
+        "checkpoint_selection": (
+            "ema_generated_normalized_mse"
+            if (args.overfit_one or args.overfit_episode)
+            else "val_noise_loss"
+        ),
         "batch_size": int(
             args.batch_size
         ),
@@ -2144,7 +2269,8 @@ def train(args):
     }
 
     start_step = 0
-    best_val = float("inf")
+    best_metric = float("inf")
+    best_metric_name = config["checkpoint_selection"]
 
     if args.resume is not None:
         checkpoint = torch.load(
@@ -2174,6 +2300,11 @@ def train(args):
             "unet_down_dims",
             "unet_kernel_size",
             "unet_n_groups",
+            "action_normalization",
+            "action_range_eps",
+            "clip_sample",
+            "clip_sample_range",
+            "checkpoint_selection",
             "batch_size",
             "learning_rate",
             "total_steps",
@@ -2238,10 +2369,27 @@ def train(args):
         start_step = int(
             checkpoint["step"]
         )
-        best_val = float(
+        saved_best_metric_name = checkpoint.get(
+            "best_metric_name",
             checkpoint.get(
-                "best_val",
-                float("inf"),
+                "config", {}
+            ).get(
+                "checkpoint_selection",
+                best_metric_name,
+            ),
+        )
+        if saved_best_metric_name != best_metric_name:
+            raise ValueError(
+                "Resume checkpoint selection metric mismatch: "
+                f"saved={saved_best_metric_name!r}, current={best_metric_name!r}"
+            )
+        best_metric = float(
+            checkpoint.get(
+                "best_metric",
+                checkpoint.get(
+                    "best_val",
+                    float("inf"),
+                ),
             )
         )
 
@@ -2405,27 +2553,41 @@ def train(args):
                 seed=args.val_seed,
             )
 
-            sample_metrics = (
-                validate_generated_actions(
-                    model=ema_model,
+            sample_metrics = validate_generated_actions(
+                model=ema_model,
+                val_loader=val_loader,
+                stats=train_dataset.stats,
+                device=device,
+                max_batches=args.sample_val_batches,
+                seed=args.sample_val_seed,
+            )
+
+            model_sample_metrics = None
+            if args.overfit_one or args.overfit_episode:
+                model_sample_metrics = validate_generated_actions(
+                    model=model,
                     val_loader=val_loader,
                     stats=train_dataset.stats,
                     device=device,
-                    max_batches=(
-                        args.sample_val_batches
-                    ),
-                    seed=(
-                        args.sample_val_seed
-                    ),
+                    max_batches=args.sample_val_batches,
+                    seed=args.sample_val_seed,
                 )
-            )
 
-            improved = (
-                val_loss < best_val
-            )
+            if best_metric_name == "ema_generated_normalized_mse":
+                current_metric = float(
+                    sample_metrics["sample_normalized_mse"]
+                )
+            elif best_metric_name == "val_noise_loss":
+                current_metric = float(val_loss)
+            else:
+                raise RuntimeError(
+                    f"Unknown checkpoint selection metric: {best_metric_name}"
+                )
+
+            improved = current_metric < best_metric
 
             if improved:
-                best_val = val_loss
+                best_metric = current_metric
 
                 save_training_checkpoint(
                     path=(
@@ -2439,17 +2601,17 @@ def train(args):
                     lr_scheduler=lr_scheduler,
                     stats=train_dataset.stats,
                     config=config,
-                    best_val=best_val,
+                    best_metric=best_metric,
+                    best_metric_name=best_metric_name,
                 )
 
             record = {
                 "step": completed_step,
-                "train_loss_mean":
-                    mean_train_loss,
-                "val_noise_loss":
-                    val_loss,
-                "best_val_noise_loss":
-                    best_val,
+                "train_loss_mean": mean_train_loss,
+                "val_noise_loss": val_loss,
+                "checkpoint_metric_name": best_metric_name,
+                "checkpoint_metric": current_metric,
+                "best_checkpoint_metric": best_metric,
                 **sample_metrics,
                 "learning_rate": (
                     optimizer.param_groups[
@@ -2461,6 +2623,11 @@ def train(args):
                     - started
                 ),
             }
+            if model_sample_metrics is not None:
+                record.update({
+                    f"raw_model_{key}": value
+                    for key, value in model_sample_metrics.items()
+                })
 
             with metrics_path.open(
                 "a"
@@ -2471,10 +2638,11 @@ def train(args):
                 )
 
             print(
-                f"Validation noise: "
-                f"{val_loss:.6f} | "
-                f"Best: {best_val:.6f} | "
-                f"New best: {improved}",
+                f"Validation noise: {val_loss:.6f} | "
+                f"checkpoint metric ({best_metric_name}): "
+                f"{current_metric:.6f} | "
+                f"best: {best_metric:.6f} | "
+                f"new best: {improved}",
                 flush=True,
             )
 
@@ -2487,6 +2655,13 @@ def train(args):
             )
 
             print(
+                f"Generated normalized range: "
+                f"[{sample_metrics['sample_normalized_prediction_min']:+.5f}, "
+                f"{sample_metrics['sample_normalized_prediction_max']:+.5f}]",
+                flush=True,
+            )
+
+            print(
                 f"Generated action range: "
                 f"[{sample_metrics['sample_prediction_min']:+.5f}, "
                 f"{sample_metrics['sample_prediction_max']:+.5f}] | "
@@ -2495,6 +2670,14 @@ def train(args):
                 f"{sample_metrics['sample_target_max']:+.5f}]",
                 flush=True,
             )
+
+            if model_sample_metrics is not None:
+                print(
+                    f"Raw-model generated normalized MSE: "
+                    f"{model_sample_metrics['sample_normalized_mse']:.6f} | "
+                    f"EMA: {sample_metrics['sample_normalized_mse']:.6f}",
+                    flush=True,
+                )
 
             if (
                 args.overfit_one
@@ -2537,7 +2720,8 @@ def train(args):
                 lr_scheduler=lr_scheduler,
                 stats=train_dataset.stats,
                 config=config,
-                best_val=best_val,
+                best_metric=best_metric,
+                best_metric_name=best_metric_name,
             )
 
             print(
@@ -2558,7 +2742,8 @@ def train(args):
         lr_scheduler=lr_scheduler,
         stats=train_dataset.stats,
         config=config,
-        best_val=best_val,
+        best_metric=best_metric,
+        best_metric_name=best_metric_name,
     )
 
     print(
