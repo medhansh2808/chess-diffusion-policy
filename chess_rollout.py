@@ -5,7 +5,7 @@ from collections import deque
 from pathlib import Path
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-
+import mujoco
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import cv2
@@ -1109,6 +1109,30 @@ def run_episode(
                 not args.fixed_scene
             ),
         )
+        episode_dir = Path(
+            "/home/junior/abcdp/external/abc/cache/train_sim/"
+            "episode_019e510c-4533-7edf-a08c-bcf744629f12"  
+        )
+
+        saved_qpos = np.load(
+            episode_dir / "initial_qpos.npy"
+        ).astype(np.float64)
+
+        if saved_qpos.shape != env.data.qpos.shape:
+            raise ValueError(
+                f"Saved qpos shape {saved_qpos.shape} "
+                f"does not match env qpos shape {env.data.qpos.shape}"
+            )
+
+        env.data.qpos[:] = saved_qpos
+        env.data.qvel[:] = 0.0
+
+        mujoco.mj_forward(
+            env.model,
+            env.data,
+        )
+
+        obs = env.get_obs()   
 
         history = deque(
             [
