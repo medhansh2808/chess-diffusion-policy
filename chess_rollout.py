@@ -1037,26 +1037,25 @@ def run_episode(
     )
     below = stats["action_min"] < safety_low
     above = stats["action_max"] > safety_high
+    bad = np.flatnonzero(below | above).tolist()
 
     if np.any(below | above):
-        bad = np.flatnonzero(below | above).tolist()
-
-    print(
-        "Warning: training action range exceeds simulator actuator "
-        f"bounds for dimensions {bad}. "
-        "Actions will be saturated to simulator bounds at execution.",
-        flush=True,
-    )
-
-    for i in bad:
         print(
-            f"  dim {i}: "
-            f"train=[{stats['action_min'][i]:+.5f}, "
-            f"{stats['action_max'][i]:+.5f}] "
-            f"sim=[{safety_low[i]:+.5f}, "
-            f"{safety_high[i]:+.5f}]",
+            "Warning: training action range exceeds simulator actuator "
+            "bounds for dimensions {bad}. "
+            "Actions will be saturated to simulator bounds at execution.",
             flush=True,
         )
+
+        for i in bad:
+           print(
+                f"  dim {i}: "
+                f"train=[{stats['action_min'][i]:+.5f}, "
+                f"{stats['action_max'][i]:+.5f}] "
+                f"sim=[{safety_low[i]:+.5f}, "
+                f"{safety_high[i]:+.5f}]",
+                flush=True,
+            )
     writer = None
 
     video_path = (
