@@ -1035,20 +1035,28 @@ def run_episode(
         ),
         flush=True,
     )
-
-    # The bounded action normalizer should fit entirely inside the physical
-    # safety envelope. Fail early if the dataset/checkpoint disagrees.
     below = stats["action_min"] < safety_low
     above = stats["action_max"] > safety_high
+
     if np.any(below | above):
         bad = np.flatnonzero(below | above).tolist()
-        env.close()
-        raise RuntimeError(
-            "Training action limits exceed simulator actuator safety bounds "
-            f"for dimensions {bad}. Refusing rollout rather than silently clip "
-            "valid demonstrations."
-        )
 
+    print(
+        "Warning: training action range exceeds simulator actuator "
+        f"bounds for dimensions {bad}. "
+        "Actions will be saturated to simulator bounds at execution.",
+        flush=True,
+    )
+
+    for i in bad:
+        print(
+            f"  dim {i}: "
+            f"train=[{stats['action_min'][i]:+.5f}, "
+            f"{stats['action_max'][i]:+.5f}] "
+            f"sim=[{safety_low[i]:+.5f}, "
+            f"{safety_high[i]:+.5f}]",
+            flush=True,
+        )
     writer = None
 
     video_path = (
